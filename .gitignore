@@ -1,2 +1,4 @@
 ocr-bot.tar.gz
 config.yaml
+cmd/
+internal/

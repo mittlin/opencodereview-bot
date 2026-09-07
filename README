@@ -1,0 +1,263 @@
+# OpenCodeReview Bot 部署指南
+
+## 概述
+
+OpenCodeReview Bot 是一个 AI 代码审查服务，通过 GitLab Webhook 自动触发代码审查，支持三种事件：
+
+- **Push events** — 代码推送到分支时触发
+- **Merge Request events** — MR 创建/更新时触发
+- **Release events** — Release 发布时触发，对比两个 release 之间的差异
+
+审查结果以评论形式写入 GitLab：
+- Push/Release → commit discussions（commit 页面）
+- MR → MR discussions（MR 页面）
+
+---
+
+## 1. 前置条件
+
+### 1.1 生成 Group Access Token
+
+1. 登录 GitLab → 进入你的 Group（如 `slam`）
+2. 左侧菜单 → **Settings → General → Permissions and group features**
+3. 勾选 **Users can create project access tokens and group access tokens in this group**
+4. 左侧菜单 → **Settings → Access Tokens**
+5. 点击 **Add new token**：
+   - **Token name**: `ocr-bot`
+   - **Expiration date**: 选择合适日期（如 1 年后）
+   - **Role**: `Developer`
+   - **Scopes**: 勾选 `api` 和 `read_repository`
+6. 点击 **Create group access token**
+7. **立即复制生成的 token**（格式：`glpat-xxxxxxxxxxxxxxxxxxxx`）
+
+> ⚠️ Token 只显示一次，务必保存！
+
+### 1.2 配置 GitLab Webhook
+
+1. 登录 GitLab → 进入你的 Group（如 `slam`）
+2. 左侧菜单 → **Settings → Webhooks**
+3. 点击 **Add new webhook**：
+   - **URL**: `http://<你的服务器IP>:9999/webhook`
+   - **Secret token**: `your-webhook-secret`（自定义，用于验证请求来源）
+   - **Trigger**: 勾选以下事件：
+     - ☑ **Push events**
+     - ☑ **Merge request events**
+     - ☑ **Release events**
+   - ☑ **Enable SSL verification**（如果使用 HTTPS）
+4. 点击 **Add webhook**
+
+> 💡 只需要配置一个 Webhook URL，Bot 会根据事件类型自动分发处理。
+
+### 1.3 服务器准备
+
+确保服务器已安装 Docker：
+
+```bash
+# 检查 Docker 版本
+docker --version
+
+# 如果没有安装，执行以下命令（CentOS/RHEL）
+yum install -y docker
+systemctl start docker
+systemctl enable docker
+```
+
+---
+
+## 2. 部署 Bot
+
+### 2.1 构建 Docker 镜像
+
+将以下文件放到服务器同一目录：
+
+```
+ocr-bot/
+├── Dockerfile
+├── go.mod
+├── go.sum
+├── bot.go
+├── cmd/
+│   └── opencodereview/
+└── internal/
+```
+
+构建镜像：
+
+```bash
+cd ocr-bot
+docker build -t ocr-bot:latest .
+```
+
+### 2.2 启动容器
+
+```bash
+docker run -d --name ocr-bot \
+  --restart unless-stopped \
+  -p 9999:9999 \
+  -e BOT_TOKEN=your-bot-token \
+  -e WEBHOOK_SECRET=your-webhook-secret \
+  -e GITLAB_GROUP_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx \
+  -e GITLAB_URL=http://your-gitlab-server \
+  -e OCR_LANGUAGE=Chinese \
+  -e LLM_URL=http://your-llm-server/v1/chat/completions \
+  -e LLM_TOKEN=your-llm-api-key \
+  -e LLM_MODEL=your-model-name \
+  -e OCR_LLM_TIMEOUT=900 \
+  ocr-bot:latest
+```
+
+### 2.3 环境变量说明
+
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `BOT_TOKEN` | ✅ | — | API 认证 token（手动调用 /review 接口时使用） |
+| `WEBHOOK_SECRET` | ✅ | — | GitLab Webhook Secret Token（验证请求来源） |
+| `GITLAB_GROUP_TOKEN` | ✅ | — | Group Access Token（clone 仓库 + 调用 GitLab API） |
+| `GITLAB_URL` | ✅ | — | GitLab 服务器地址 |
+| `OCR_LANGUAGE` | 否 | `Chinese` | 审查输出语言 |
+| `LLM_URL` | ✅ | — | LLM API 地址 |
+| `LLM_TOKEN` | ✅ | — | LLM API key |
+| `LLM_MODEL` | ✅ | — | LLM 模型名称 |
+| `OCR_LLM_TIMEOUT` | 否 | `900` | LLM 请求超时（秒） |
+| `PORT` | 否 | `9999` | Bot 监听端口 |
+
+---
+
+## 3. 验证部署
+
+### 3.1 检查容器状态
+
+```bash
+# 查看容器是否运行
+docker ps | grep ocr-bot
+
+# 查看日志
+docker logs -f ocr-bot
+```
+
+### 3.2 测试健康检查
+
+```bash
+curl http://localhost:9999/health
+# 期望输出: {"status":"ok"}
+```
+
+### 3.3 测试 Webhook
+
+```bash
+# 模拟 Push event
+curl -X POST http://localhost:9999/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-Gitlab-Token: your-webhook-secret" \
+  -d '{
+    "object_kind": "push",
+    "ref": "refs/heads/master",
+    "before": "0000000000000000000000000000000000000000",
+    "after": "abc123",
+    "project": {"id": 187, "path_with_namespace": "slam/tte_map_engine"},
+    "commits": [{"id": "abc123"}]
+  }'
+```
+
+### 3.4 测试手动审查 API
+
+```bash
+curl -X POST http://localhost:9999/review \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-bot-token" \
+  -d '{
+    "project_id": 187,
+    "project_path": "slam/tte_map_engine",
+    "source_branch": "master",
+    "target_branch": "master",
+    "commit_sha": "4269836"
+  }'
+```
+
+---
+
+## 4. Webhook 事件处理
+
+Bot 使用单一端点 `/webhook`，根据 GitLab 发送的 `object_kind` 字段自动分发：
+
+### 4.1 Push events
+
+- **触发条件**: 代码推送到任意分支
+- **审查范围**: `before` → `after` 之间的 diff
+- **评论位置**: commit discussions（commit 页面可见）
+- **跳过**: 分支删除（`after` 为全零 SHA）
+
+### 4.2 Merge Request events
+
+- **触发条件**: MR 创建（open）、重新打开（reopen）、更新（update）
+- **审查范围**: source_branch → target_branch 的 diff
+- **评论位置**: MR discussions（MR 页面可见）
+- **跳过**: 其他 action（close, merge 等）
+
+### 4.3 Release events
+
+- **触发条件**: Release 发布
+- **审查范围**: 前一个 release tag → 当前 release tag 之间的 diff
+- **评论位置**: 新 release tag 对应 commit 的 discussions
+- **实现**: 通过 Release API 获取所有 release，按时间排序找到前一个 tag
+
+---
+
+## 5. 常见问题
+
+### 5.1 Bot 无法 clone 私有仓库
+
+检查 `GITLAB_GROUP_TOKEN` 是否正确配置，token 是否有 `read_repository` scope。
+
+### 5.2 Webhook 返回 403 Forbidden
+
+检查 GitLab Webhook 配置中的 **Secret token** 是否与容器的 `WEBHOOK_SECRET` 环境变量一致。
+
+### 5.3 LLM 超时
+
+Qwen3.6-27B 模型较慢，建议设置 `OCR_LLM_TIMEOUT=900`（15 分钟）。
+
+### 5.4 查看实时日志
+
+```bash
+docker logs -f --tail 100 ocr-bot
+```
+
+### 5.5 重启容器
+
+```bash
+docker restart ocr-bot
+```
+
+### 5.6 更新镜像
+
+```bash
+docker stop ocr-bot && docker rm ocr-bot
+docker build -t ocr-bot:latest .
+docker run -d --name ocr-bot ...  # 使用之前的启动命令
+```
+
+---
+
+## 6. 架构图
+
+```
+GitLab (http://xxxx)
+    │
+    │  Webhook (Secret Token)
+    ▼
+┌─────────────────────────────────────┐
+│  OpenCodeReview Bot (:9999)         │
+│                                     │
+│  /webhook ──┬── push ──→ OCR ──→ commit discussions
+│             ├── mr ────→ OCR ──→ MR discussions
+│             └── release→ OCR ──→ commit discussions
+│                                     │
+│  /review (手动 API)                  │
+│  /health (健康检查)                  │
+└─────────────────────────────────────┘
+    │
+    │  Group Access Token (clone + API)
+    ▼
+GitLab Repository (clone) + GitLab API (post comments)
+```
