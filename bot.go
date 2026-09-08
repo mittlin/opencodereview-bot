@@ -320,7 +320,7 @@ func pushHandler(w http.ResponseWriter, r *http.Request, event PushEvent) {
 	}
 
 	branch := strings.TrimPrefix(event.Ref, "refs/heads/")
-	log.Printf("Push event: project=%d branch=%s commits=%d", event.Project.ID, branch, len(event.Commits))
+	log.Printf("Push event: project=%s branch=%s commits=%d", event.Project.PathWithNamespace, branch, len(event.Commits))
 
 	// Immediately return 202 Accepted
 	w.WriteHeader(http.StatusAccepted)
@@ -348,7 +348,7 @@ func mrHandler(w http.ResponseWriter, r *http.Request, event MergeRequestEvent) 
 		return
 	}
 
-	log.Printf("MR event: project=%d MR=!%d action=%s", event.Project.ID, event.ObjectAttributes.IID, action)
+	log.Printf("MR event: project=%s MR=!%d action=%s", event.Project.PathWithNamespace, event.ObjectAttributes.IID, action)
 
 	// Immediately return 202 Accepted
 	w.WriteHeader(http.StatusAccepted)
@@ -370,7 +370,7 @@ func mrHandler(w http.ResponseWriter, r *http.Request, event MergeRequestEvent) 
 // ── Webhook: Release events ─────────────────────────────────────────────────
 
 func releaseHandler(w http.ResponseWriter, r *http.Request, event ReleaseEvent) {
-	log.Printf("Release event: project=%d tag=%s", event.Project.ID, event.Release.TagName)
+	log.Printf("Release event: project=%s tag=%s", event.Project.PathWithNamespace, event.Release.TagName)
 
 	// Get previous release tag (fast API call, not in async)
 	prevTag, err := getPrevReleaseTag(event.Project.ID, event.Release.TagName)
@@ -511,8 +511,13 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourceBranch, targetBranch string,
 	postFunc func(int, string, []ReviewComment)) {
 
-	log.Printf("Queued review: project=%d from=%s to=%s event=%s branch=%s (active=%d)",
-		projectID, fromSHA, toSHA, eventType, sourceBranch, atomic.LoadInt32(&activeReviews))
+	displayProject := projectPath
+	if displayProject == "" {
+		displayProject = fmt.Sprintf("%d", projectID)
+	}
+
+	log.Printf("Queued review: project=%s from=%s to=%s event=%s branch=%s (active=%d)",
+		displayProject, fromSHA, toSHA, eventType, sourceBranch, atomic.LoadInt32(&activeReviews))
 
 	reviewSemaphore <- struct{}{}
 	atomic.AddInt32(&activeReviews, 1)
@@ -521,8 +526,8 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 		<-reviewSemaphore
 	}()
 
-	log.Printf("Starting review: project=%d from=%s to=%s event=%s branch=%s",
-		projectID, fromSHA, toSHA, eventType, sourceBranch)
+	log.Printf("Starting review: project=%s from=%s to=%s event=%s branch=%s",
+		displayProject, fromSHA, toSHA, eventType, sourceBranch)
 
 	reviewTimeoutMin, _ := strconv.Atoi(reviewTimeout)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(reviewTimeoutMin)*time.Minute)
@@ -539,14 +544,14 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 
 	result, err := runReview(ctx, req)
 	if err != nil {
-		log.Printf("Review error: project=%d from=%s to=%s error=%v",
-			projectID, fromSHA, toSHA, err)
+		log.Printf("Review error: project=%s from=%s to=%s error=%v",
+			displayProject, fromSHA, toSHA, err)
 		return
 	}
 
 	postFunc(projectID, toSHA, result.Comments)
-	log.Printf("Review completed: project=%d from=%s to=%s comments=%d",
-		projectID, fromSHA, toSHA, len(result.Comments))
+	log.Printf("Review completed: project=%s from=%s to=%s comments=%d",
+		displayProject, fromSHA, toSHA, len(result.Comments))
 }
 
 func configLLM(ctx context.Context) {
