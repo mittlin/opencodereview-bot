@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -110,6 +111,8 @@ var (
 	llmModel        string
 	language        string
 	llmTimeout      string
+	reviewTimeout   string
+	perFileTimeout  string
 
 	// Queue control
 	reviewSemaphore = make(chan struct{}, 1) // max 1 concurrent review
@@ -129,6 +132,8 @@ func main() {
 	llmModel = os.Getenv("LLM_MODEL")
 	language = getEnvWithDefault("OCR_LANGUAGE", "Chinese")
 	llmTimeout = getEnvWithDefault("OCR_LLM_TIMEOUT", "900")
+	reviewTimeout = getEnvWithDefault("OCR_REVIEW_TIMEOUT", "60")
+	perFileTimeout = getEnvWithDefault("OCR_PER_FILE_TIMEOUT", "30")
 
 	if botToken == "" {
 		log.Fatal("BOT_TOKEN is required")
@@ -287,7 +292,8 @@ func reviewHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+	reviewTimeoutMin, _ := strconv.Atoi(reviewTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(reviewTimeoutMin)*time.Minute)
 	defer cancel()
 
 	result, err := runReview(ctx, req)
@@ -432,7 +438,7 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 		"--audience", "agent",
 		"--repo", repoDir,
 		"--model", llmModel,
-		"--timeout", "30",
+		"--timeout", perFileTimeout,
 	}
 	// Priority: FromSHA+CommitSHA > CommitSHA > from target branch
 	if req.FromSHA != "" && req.CommitSHA != "" {
@@ -518,7 +524,8 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 	log.Printf("Starting review: project=%d from=%s to=%s event=%s branch=%s",
 		projectID, fromSHA, toSHA, eventType, sourceBranch)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	reviewTimeoutMin, _ := strconv.Atoi(reviewTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(reviewTimeoutMin)*time.Minute)
 	defer cancel()
 
 	req := ReviewRequest{
