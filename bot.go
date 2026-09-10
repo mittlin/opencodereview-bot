@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/open-code-review/open-code-review/internal/llm"
+	"github.com/alibaba/open-code-review/internal/llm"
 )
 
 // ── Review request/response (existing) ──────────────────────────────────────
@@ -113,6 +113,9 @@ var (
 	llmTimeout      string
 	reviewTimeout   string
 	perFileTimeout  string
+	maxTokensBudget string
+	effort          string
+	provider        string
 
 	// Queue control
 	reviewSemaphore = make(chan struct{}, 1) // max 1 concurrent review
@@ -120,7 +123,7 @@ var (
 )
 
 func main() {
-	llm.AppVersion = "bot-1.0"
+	llm.AppVersion = "bot-1.11.7"
 	llm.InitEmbeddedLoader()
 
 	botToken = os.Getenv("BOT_TOKEN")
@@ -134,6 +137,9 @@ func main() {
 	llmTimeout = getEnvWithDefault("OCR_LLM_TIMEOUT", "900")
 	reviewTimeout = getEnvWithDefault("OCR_REVIEW_TIMEOUT", "60")
 	perFileTimeout = getEnvWithDefault("OCR_PER_FILE_TIMEOUT", "30")
+	maxTokensBudget = getEnvWithDefault("OCR_MAX_TOKENS_BUDGET", "")
+	effort = getEnvWithDefault("OCR_EFFORT", "")
+	provider = getEnvWithDefault("OCR_PROVIDER", "")
 
 	if botToken == "" {
 		log.Fatal("BOT_TOKEN is required")
@@ -456,10 +462,20 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 		args = append(args, "--exclude", strings.Join(req.ExcludePaths, ","))
 	}
 
+	if maxTokensBudget != "" {
+		args = append(args, "--max-tokens-budget", maxTokensBudget)
+	}
+	if effort != "" {
+		args = append(args, "--effort", effort)
+	}
+	if provider != "" {
+		args = append(args, "--provider", provider)
+	}
+
 	cmd := exec.CommandContext(ctx, "/root/ocr-bot", args...)
 	cmd.Env = append(os.Environ(),
 		"OCR_LLM_URL="+llmURL,
-		"OCR_LLM_AUTH_TOKEN="+llmToken,
+		"OCR_LLM_TOKEN="+llmToken,
 		"OCR_LLM_MODEL="+llmModel,
 		"OCR_LLM_TIMEOUT="+llmTimeout,
 		"HOME=/root",
@@ -564,13 +580,13 @@ func configLLM(ctx context.Context) {
 		"language":         language,
 	}
 	for key, val := range configs {
-		setCmd := exec.CommandContext(ctx, "/root/ocr-bot", "config", "set", key, val)
-		setCmd.Env = append(os.Environ(),
-			"OCR_LLM_URL="+llmURL,
-			"OCR_LLM_AUTH_TOKEN="+llmToken,
-			"OCR_LLM_MODEL="+llmModel,
-			"HOME=/root",
-		)
+setCmd := exec.CommandContext(ctx, "/root/ocr-bot", "config", "set", key, val)
+	setCmd.Env = append(os.Environ(),
+		"OCR_LLM_URL="+llmURL,
+		"OCR_LLM_TOKEN="+llmToken,
+		"OCR_LLM_MODEL="+llmModel,
+		"HOME=/root",
+	)
 		if output, err := setCmd.CombinedOutput(); err != nil {
 			log.Printf("Warning: failed to set %s: %v, output: %s", key, err, string(output))
 		}

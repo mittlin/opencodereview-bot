@@ -68,22 +68,14 @@ systemctl enable docker
 
 ### 2.1 构建 Docker 镜像
 
-将以下文件放到服务器同一目录：
-
-```
-ocr-bot/
-├── Dockerfile
-├── go.mod
-├── go.sum
-├── bot.go
-├── cmd/
-│   └── opencodereview/
-└── internal/
-```
+本项目使用 git submodule 引入上游代码（`upstream/` 目录，锁定在 v1.11.7 tag）。
 
 构建镜像：
 
 ```bash
+# 初始化 submodule（首次部署时）
+git submodule update --init --recursive
+
 cd ocr-bot
 docker build -t ocr-bot:latest .
 ```
@@ -119,6 +111,9 @@ docker run -d --name ocr-bot \
 | `LLM_TOKEN` | ✅ | — | LLM API key |
 | `LLM_MODEL` | ✅ | — | LLM 模型名称 |
 | `OCR_LLM_TIMEOUT` | 否 | `900` | LLM 请求超时（秒） |
+| `OCR_MAX_TOKENS_BUDGET` | 否 | — | 总 token 预算限制（对应 `--max-tokens-budget`） |
+| `OCR_EFFORT` | 否 | — | 审查 effort 预设：low/medium/high（对应 `--effort`） |
+| `OCR_PROVIDER` | 否 | — | LLM provider 覆盖（对应 `--provider`） |
 | `PORT` | 否 | `9999` | Bot 监听端口 |
 
 ---
@@ -217,19 +212,23 @@ Bot 使用单一端点 `/webhook`，根据 GitLab 发送的 `object_kind` 字段
 
 Qwen3.6-27B 模型较慢，建议设置 `OCR_LLM_TIMEOUT=900`（15 分钟）。
 
-### 5.4 查看实时日志
+### 5.4 LLM 认证失败
+
+检查环境变量使用 `OCR_LLM_TOKEN`（不是 `OCR_LLM_AUTH_TOKEN`）。
+
+### 5.5 查看实时日志
 
 ```bash
 docker logs -f --tail 100 ocr-bot
 ```
 
-### 5.5 重启容器
+### 5.6 重启容器
 
 ```bash
 docker restart ocr-bot
 ```
 
-### 5.6 更新镜像
+### 5.7 更新镜像
 
 ```bash
 docker stop ocr-bot && docker rm ocr-bot
@@ -239,7 +238,15 @@ docker run -d --name ocr-bot ...  # 使用之前的启动命令
 
 ---
 
-## 6. 架构图
+## 6. 版本信息
+
+- **当前版本**: v1.11.7 (基于 alibaba/open-code-review@810aeb5)
+- **模块路径**: `github.com/alibaba/open-code-review`
+- **上游 submodule**: `upstream/` @ v1.11.7 tag
+
+---
+
+## 7. 架构图
 
 ```
 GitLab (http://xxxx)
@@ -261,3 +268,4 @@ GitLab (http://xxxx)
     ▼
 GitLab Repository (clone) + GitLab API (post comments)
 ```
+

@@ -1,4 +1,13 @@
-ocr-bot.tar.gz
-config.yaml
-cmd/
-internal/
+# Build artifacts
+ocr-bot
+ocr-bot-server
+
+# Submodule
+upstream/
+
+# Backup (temporary)
+internal.bak/
+cmd.bak/
+
+# Config (contains secrets)
+config.json
