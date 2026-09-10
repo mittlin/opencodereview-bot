@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -172,6 +173,8 @@ func main() {
 
 	// Manual review API
 	http.HandleFunc("/review", authMiddleware(reviewHandler))
+	// Review report download (requires auth)
+	http.HandleFunc("/review/", authMiddleware(reportHandler))
 	// Health check
 	http.HandleFunc("/health", healthHandler)
 	// Status endpoint for queue monitoring
@@ -191,6 +194,41 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		"active_reviews": atomic.LoadInt32(&activeReviews),
 		"queue_capacity": 1,
 	})
+}
+
+// reportHandler serves the stored review report by review ID
+// GET /review/<review-id>
+func reportHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract review ID from path: /review/<review-id>
+	path := strings.TrimPrefix(r.URL.Path, "/review/")
+	if path == "" || path == r.URL.Path {
+		http.Error(w, "Review ID required", http.StatusBadRequest)
+		return
+	}
+
+	// Sanitize review ID to prevent path traversal
+	reviewID := filepath.Base(path)
+	if reviewID == "." || reviewID == ".." || strings.Contains(reviewID, "/") {
+		http.Error(w, "Invalid review ID", http.StatusBadRequest)
+		return
+	}
+
+	reportPath := filepath.Join(outputDir, fmt.Sprintf("%s.json", reviewID))
+	
+	// Check if file exists
+	if _, err := os.Stat(reportPath); os.IsNotExist(err) {
+		http.Error(w, "Review report not found", http.StatusNotFound)
+		return
+	}
+
+	// Serve the file
+	w.Header().Set("Content-Type", "application/json")
+	http.ServeFile(w, r, reportPath)
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -414,6 +452,11 @@ func releaseHandler(w http.ResponseWriter, r *http.Request, event ReleaseEvent) 
 
 // ── Core review logic ───────────────────────────────────────────────────────
 
+const (
+	outputDir = "/data/ocr-reviews"
+	homeDir   = "/data/ocr-home"
+)
+
 func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) {
 	var repoDir string
 	var err error
@@ -423,7 +466,7 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 		repoDir = req.LocalRepo
 		log.Printf("Using local repo: %s", repoDir)
 		safeCmd := exec.CommandContext(ctx, "git", "config", "--global", "--add", "safe.directory", repoDir)
-		safeCmd.Env = append(os.Environ(), "HOME=/root")
+		safeCmd.Env = append(os.Environ(), "HOME="+homeDir)
 		if out, err := safeCmd.CombinedOutput(); err != nil {
 			log.Printf("Warning: git config safe.directory failed: %v, output: %s", err, string(out))
 		}
@@ -438,6 +481,21 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 
 	configLLM(ctx)
 
+	// Generate review ID with project path and commit SHA for readability
+	projectPath := req.ProjectPath
+	if projectPath == "" {
+		projectPath = fmt.Sprintf("project-%d", req.ProjectID)
+	}
+	// Sanitize path for filename (replace / with -)
+	safeProjectPath := strings.ReplaceAll(projectPath, "/", "-")
+	// Include commit SHA (short) in filename
+	shortCommit := req.CommitSHA
+	if len(shortCommit) > 8 {
+		shortCommit = shortCommit[:8]
+	}
+	reviewID := fmt.Sprintf("ocr-%s-%s-%d", safeProjectPath, shortCommit, time.Now().Unix())
+	outputPath := filepath.Join(outputDir, fmt.Sprintf("%s.json", reviewID))
+
 	args := []string{
 		"review",
 		"--format", "json",
@@ -445,6 +503,7 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 		"--repo", repoDir,
 		"--model", llmModel,
 		"--timeout", perFileTimeout,
+		"--output", outputPath,
 	}
 	// Priority: FromSHA+CommitSHA > CommitSHA > from target branch
 	if req.FromSHA != "" && req.CommitSHA != "" {
@@ -478,7 +537,7 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 		"OCR_LLM_TOKEN="+llmToken,
 		"OCR_LLM_MODEL="+llmModel,
 		"OCR_LLM_TIMEOUT="+llmTimeout,
-		"HOME=/root",
+		"HOME="+homeDir,
 	)
 
 	var stdout, stderr bytes.Buffer
@@ -511,8 +570,6 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 	if m := ocrResult["message"]; m != nil {
 		summary = m.(string)
 	}
-
-	reviewID := fmt.Sprintf("ocr-%d-%d", req.ProjectID, time.Now().Unix())
 
 	return &ReviewResponse{
 		Status:   "success",
@@ -580,13 +637,13 @@ func configLLM(ctx context.Context) {
 		"language":         language,
 	}
 	for key, val := range configs {
-setCmd := exec.CommandContext(ctx, "/root/ocr-bot", "config", "set", key, val)
-	setCmd.Env = append(os.Environ(),
-		"OCR_LLM_URL="+llmURL,
-		"OCR_LLM_TOKEN="+llmToken,
-		"OCR_LLM_MODEL="+llmModel,
-		"HOME=/root",
-	)
+		setCmd := exec.CommandContext(ctx, "/root/ocr-bot", "config", "set", key, val)
+		setCmd.Env = append(os.Environ(),
+			"OCR_LLM_URL="+llmURL,
+			"OCR_LLM_TOKEN="+llmToken,
+			"OCR_LLM_MODEL="+llmModel,
+			"HOME="+homeDir,
+		)
 		if output, err := setCmd.CombinedOutput(); err != nil {
 			log.Printf("Warning: failed to set %s: %v, output: %s", key, err, string(output))
 		}
