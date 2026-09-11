@@ -532,7 +532,7 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 		args = append(args, "--provider", provider)
 	}
 
-	cmd := exec.CommandContext(ctx, "/root/ocr-bot", args...)
+	cmd := exec.CommandContext(ctx, "/usr/local/bin/ocr", args...)
 	cmd.Env = append(os.Environ(),
 		"OCR_LLM_URL="+llmURL,
 		"OCR_LLM_TOKEN="+llmToken,
@@ -633,7 +633,7 @@ func configLLM(ctx context.Context) {
 		"language":         language,
 	}
 	for key, val := range configs {
-		setCmd := exec.CommandContext(ctx, "/root/ocr-bot", "config", "set", key, val)
+		setCmd := exec.CommandContext(ctx, "/usr/local/bin/ocr", "config", "set", key, val)
 		setCmd.Env = append(os.Environ(),
 			"OCR_LLM_URL="+llmURL,
 			"OCR_LLM_TOKEN="+llmToken,
