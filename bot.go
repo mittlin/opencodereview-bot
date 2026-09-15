@@ -377,8 +377,31 @@ func pushHandler(w http.ResponseWriter, r *http.Request, event PushEvent) {
 	// Async: review from before to after (entire push range)
 	go runReviewAsync(event.Project.ID, event.Before, event.After,
 		event.Project.PathWithNamespace, "push", branch, branch,
-		func(pid int, sha string, comments []ReviewComment) {
-			postCommentsToCommit(pid, sha, comments)
+		func(pid int, sha string, comments []ReviewComment, repoDir string) {
+			// Build file -> commit map for distributing comments
+			ctx := context.Background()
+			fileToCommit, err := buildFileToCommitMap(ctx, repoDir, event.Before, event.After)
+			if err != nil {
+				log.Printf("Warning: failed to build file-commit map: %v, falling back to after SHA", err)
+				postCommentsToCommit(pid, sha, comments)
+				return
+			}
+
+			// Group comments by target commit
+			commentsByCommit := make(map[string][]ReviewComment)
+			for _, c := range comments {
+				targetSHA := fileToCommit[c.File]
+				if targetSHA == "" {
+					targetSHA = sha // fallback to after SHA
+					log.Printf("Warning: no commit mapping for file %s, using after SHA", c.File)
+				}
+				commentsByCommit[targetSHA] = append(commentsByCommit[targetSHA], c)
+			}
+
+			// Post to each commit
+			for commitSHA, cs := range commentsByCommit {
+				postCommentsToCommit(pid, commitSHA, cs)
+			}
 		})
 }
 
@@ -407,7 +430,7 @@ func mrHandler(w http.ResponseWriter, r *http.Request, event MergeRequestEvent) 
 	go runReviewAsync(event.Project.ID, "", event.ObjectAttributes.LastCommitSHA,
 		event.Project.PathWithNamespace, "merge_request",
 		event.ObjectAttributes.SourceBranch, event.ObjectAttributes.TargetBranch,
-		func(pid int, sha string, comments []ReviewComment) {
+		func(pid int, sha string, comments []ReviewComment, repoDir string) {
 			postCommentsToMR(pid, mrIID, comments)
 		})
 }
@@ -446,7 +469,7 @@ func releaseHandler(w http.ResponseWriter, r *http.Request, event ReleaseEvent) 
 	go runReviewAsync(event.Project.ID, prevTag, tagCommitSHA,
 		event.Project.PathWithNamespace, "release",
 		event.Release.TagName, event.Release.TagName,
-		func(pid int, sha string, comments []ReviewComment) {
+		func(pid int, sha string, comments []ReviewComment, repoDir string) {
 			postCommentsToCommit(pid, sha, comments)
 		})
 }
@@ -461,16 +484,11 @@ const (
 func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) {
 	var repoDir string
 	var err error
-	cleanup := func() {}
+	var cleanup func()
 
 	if req.LocalRepo != "" {
 		repoDir = req.LocalRepo
-		log.Printf("Using local repo: %s", repoDir)
-		safeCmd := exec.CommandContext(ctx, "git", "config", "--global", "--add", "safe.directory", repoDir)
-		safeCmd.Env = append(os.Environ(), "HOME="+homeDir)
-		if out, err := safeCmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: git config safe.directory failed: %v, output: %s", err, string(out))
-		}
+		cleanup = func() {}
 	} else {
 		repoDir, err = cloneRepo(ctx, req)
 		if err != nil {
@@ -479,6 +497,21 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 		cleanup = func() { os.RemoveAll(repoDir) }
 	}
 	defer cleanup()
+
+	return runReviewWithRepoDir(ctx, req, repoDir)
+}
+
+// runReviewWithRepoDir executes review using an already-prepared repoDir.
+// Caller is responsible for repoDir lifecycle (clone/cleanup).
+func runReviewWithRepoDir(ctx context.Context, req ReviewRequest, repoDir string) (*ReviewResponse, error) {
+	// Ensure safe.directory for local repos
+	if req.LocalRepo != "" {
+		safeCmd := exec.CommandContext(ctx, "git", "config", "--global", "--add", "safe.directory", repoDir)
+		safeCmd.Env = append(os.Environ(), "HOME="+homeDir)
+		if out, err := safeCmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: git config safe.directory failed: %v, output: %s", err, string(out))
+		}
+	}
 
 	configLLM(ctx)
 
@@ -545,7 +578,7 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 	cmd.Stdout = nil
 	cmd.Stderr = &stderr
 
-	err = cmd.Run()
+	err := cmd.Run()
 	if err != nil {
 		log.Printf("OCR stderr: %s", stderr.String())
 		return nil, fmt.Errorf("ocr review failed: %w, stderr: %s", err, stderr.String())
@@ -577,8 +610,9 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 }
 
 // runReviewAsync executes review in background with concurrency control.
+// postFunc receives: projectID, commitSHA, comments, repoDir
 func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourceBranch, targetBranch string,
-	postFunc func(int, string, []ReviewComment)) {
+	postFunc func(int, string, []ReviewComment, string)) {
 
 	displayProject := projectPath
 	if displayProject == "" {
@@ -611,14 +645,32 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 		TargetBranch: targetBranch,
 	}
 
-	result, err := runReview(ctx, req)
+	// Determine repoDir before calling runReview so we can pass it to callback
+	var repoDir string
+	var err error
+	var cleanup func()
+	if req.LocalRepo != "" {
+		repoDir = req.LocalRepo
+		cleanup = func() {}
+	} else {
+		repoDir, err = cloneRepo(ctx, req)
+		if err != nil {
+			log.Printf("Review error: project=%s from=%s to=%s clone failed: %v",
+				displayProject, fromSHA, toSHA, err)
+			return
+		}
+		cleanup = func() { os.RemoveAll(repoDir) }
+	}
+	defer cleanup()
+
+	result, err := runReviewWithRepoDir(ctx, req, repoDir)
 	if err != nil {
 		log.Printf("Review error: project=%s from=%s to=%s error=%v",
 			displayProject, fromSHA, toSHA, err)
 		return
 	}
 
-	postFunc(projectID, toSHA, result.Comments)
+	postFunc(projectID, toSHA, result.Comments, repoDir)
 	log.Printf("Review completed: project=%s from=%s to=%s comments=%d",
 		displayProject, fromSHA, toSHA, len(result.Comments))
 }
@@ -697,6 +749,56 @@ func cloneRepo(ctx context.Context, req ReviewRequest) (string, error) {
 	}
 
 	return repoDir, nil
+}
+
+// buildFileToCommitMap runs git log --name-only from..to and returns
+// a map of filePath -> lastCommitSHA that modified that file in the range.
+// Only considers Added, Modified, Deleted, Renamed files (--diff-filter=AMDR).
+func buildFileToCommitMap(ctx context.Context, repoDir, fromSHA, toSHA string) (map[string]string, error) {
+	// Handle first push (fromSHA is zero SHA) - use all commits up to toSHA
+	var logRange string
+	zeroSHA := "0000000000000000000000000000000000000000"
+	if fromSHA == zeroSHA {
+		logRange = toSHA
+	} else {
+		logRange = fromSHA + ".." + toSHA
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "log", "--name-only", "--pretty=format:%H", "--diff-filter=AMDR", "--", logRange)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("git log failed: %w, output: %s", err, string(output))
+	}
+
+	fileToCommit := make(map[string]string)
+	var currentCommit string
+
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Commit SHA is 40 hex chars
+		if len(line) == 40 && isHexString(line) {
+			currentCommit = line
+			continue
+		}
+		// File path
+		if currentCommit != "" {
+			fileToCommit[line] = currentCommit
+		}
+	}
+
+	return fileToCommit, nil
+}
+
+func isHexString(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // initSubmodulesWithAuth reads .gitmodules, builds insteadOf rules to inject
