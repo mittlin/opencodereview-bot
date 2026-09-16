@@ -47,11 +47,16 @@ type ReviewResponse struct {
 }
 
 type ReviewComment struct {
-	File     string `json:"file"`
-	Line     int    `json:"line"`
-	Message  string `json:"message"`
-	Severity string `json:"severity"`
-	Tool     string `json:"tool"`
+	File            string `json:"file"`
+	Line            int    `json:"line"`
+	EndLine         int    `json:"end_line"`
+	Message         string `json:"message"`
+	SuggestionCode  string `json:"suggestion_code"`
+	ExistingCode    string `json:"existing_code"`
+	Severity        string `json:"severity"`
+	Category        string `json:"category"`
+	Thinking        string `json:"thinking"`
+	Tool            string `json:"tool"`
 }
 
 // ── GitLab Webhook event structs ────────────────────────────────────────────
@@ -403,7 +408,7 @@ func pushHandler(w http.ResponseWriter, r *http.Request, event PushEvent) {
 			fileToCommit, err := buildFileToCommitMap(ctx, repoDir, event.Before, event.After)
 			if err != nil {
 				log.Printf("Warning: failed to build file-commit map: %v, falling back to after SHA", err)
-				postCommentsToCommit(pid, sha, comments)
+				postCommentsToCommit(pid, sha, comments, event.Project.PathWithNamespace, branch)
 				return
 			}
 
@@ -420,7 +425,7 @@ func pushHandler(w http.ResponseWriter, r *http.Request, event PushEvent) {
 
 			// Post to each commit
 			for commitSHA, cs := range commentsByCommit {
-				postCommentsToCommit(pid, commitSHA, cs)
+				postCommentsToCommit(pid, commitSHA, cs, event.Project.PathWithNamespace, branch)
 			}
 		})
 }
@@ -451,7 +456,7 @@ func mrHandler(w http.ResponseWriter, r *http.Request, event MergeRequestEvent) 
 		event.Project.PathWithNamespace, "merge_request",
 		event.ObjectAttributes.SourceBranch, event.ObjectAttributes.TargetBranch,
 		func(pid int, sha string, comments []ReviewComment, repoDir string) {
-			postCommentsToMR(pid, mrIID, comments)
+			postCommentsToMR(pid, mrIID, comments, event.Project.PathWithNamespace, event.ObjectAttributes.TargetBranch)
 		})
 }
 
@@ -490,7 +495,7 @@ func releaseHandler(w http.ResponseWriter, r *http.Request, event ReleaseEvent) 
 		event.Project.PathWithNamespace, "release",
 		event.Release.TagName, event.Release.TagName,
 		func(pid int, sha string, comments []ReviewComment, repoDir string) {
-			postCommentsToCommit(pid, sha, comments)
+			postCommentsToCommit(pid, sha, comments, event.Project.PathWithNamespace, event.Release.TagName)
 		})
 }
 
@@ -997,7 +1002,7 @@ func getPrevReleaseTag(projectID int, currentTag string) (string, error) {
 
 // ── GitLab API: post comments ──────────────────────────────────────────────
 
-func postCommentsToMR(projectID, mrIID int, comments []ReviewComment) {
+func postCommentsToMR(projectID, mrIID int, comments []ReviewComment, projectPath, defaultBranch string) {
 	if gitlabToken == "" {
 		return
 	}
@@ -1006,7 +1011,7 @@ func postCommentsToMR(projectID, mrIID int, comments []ReviewComment) {
 		url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d/discussions", gitlabURL, projectID, mrIID)
 
 		body := map[string]interface{}{
-			"body": comment.Message,
+			"body": formatCommentBody(comment, gitlabURL, projectPath, defaultBranch),
 			"position": map[string]interface{}{
 				"position_type": "text",
 				"new_path":      comment.File,
@@ -1031,7 +1036,7 @@ func postCommentsToMR(projectID, mrIID int, comments []ReviewComment) {
 	}
 }
 
-func postCommentsToCommit(projectID int, commitSHA string, comments []ReviewComment) {
+func postCommentsToCommit(projectID int, commitSHA string, comments []ReviewComment, projectPath, defaultBranch string) {
 	if gitlabToken == "" {
 		return
 	}
@@ -1040,7 +1045,7 @@ func postCommentsToCommit(projectID int, commitSHA string, comments []ReviewComm
 		url := fmt.Sprintf("%s/api/v4/projects/%d/repository/commits/%s/discussions", gitlabURL, projectID, commitSHA)
 
 		body := map[string]interface{}{
-			"body": comment.Message,
+			"body": formatCommentBody(comment, gitlabURL, projectPath, defaultBranch),
 		}
 
 		jsonBody, _ := json.Marshal(body)
@@ -1075,14 +1080,76 @@ func convertComments(raw interface{}) []ReviewComment {
 		}
 
 		comments = append(comments, ReviewComment{
-			File:     getString(cm, "path"),
-			Line:     getInt(cm, "end_line"),
-			Message:  getString(cm, "content"),
-			Severity: getString(cm, "severity"),
-			Tool:     "code_review",
+			File:            getString(cm, "path"),
+			Line:            getInt(cm, "start_line"),
+			EndLine:         getInt(cm, "end_line"),
+			Message:         getString(cm, "content"),
+			SuggestionCode:  getString(cm, "suggestion_code"),
+			ExistingCode:    getString(cm, "existing_code"),
+			Severity:        getString(cm, "severity"),
+			Category:        getString(cm, "category"),
+			Thinking:        getString(cm, "thinking"),
+			Tool:            "code_review",
 		})
 	}
 	return comments
+}
+
+// formatCommentBody creates a rich markdown body for GitLab comments
+func formatCommentBody(c ReviewComment, gitlabURL, projectPath, defaultBranch string) string {
+	var b strings.Builder
+
+	// File link with line range
+	codeLink := fmt.Sprintf("[%s:%d-%d](%s/%s/-/blob/%s/%s#L%d-L%d)",
+		c.File, c.Line, c.EndLine, gitlabURL, projectPath, defaultBranch, c.File, c.Line, c.EndLine)
+
+	// Header with severity and category badges
+	sev := strings.ToUpper(c.Severity)
+	cat := c.Category
+	if cat == "" {
+		cat = "general"
+	}
+	b.WriteString(fmt.Sprintf("**%s** [%s] (%s)\n\n", codeLink, sev, cat))
+
+	// Main message
+	if c.Message != "" {
+		b.WriteString(fmt.Sprintf("%s\n\n", c.Message))
+	}
+
+	// Thinking (collapsible)
+	if c.Thinking != "" {
+		b.WriteString("<details>\n<summary><strong>Analysis</strong></summary>\n\n")
+		b.WriteString(fmt.Sprintf("%s\n\n", c.Thinking))
+		b.WriteString("</details>\n\n")
+	}
+
+	// Existing code
+	if c.ExistingCode != "" {
+		b.WriteString("**Existing Code:**\n")
+		ext := getFileExt(c.File)
+		b.WriteString(fmt.Sprintf("```%s\n%s\n```\n\n", ext, c.ExistingCode))
+	}
+
+	// Suggestion code
+	if c.SuggestionCode != "" {
+		b.WriteString("**Suggestion:**\n")
+		ext := getFileExt(c.File)
+		b.WriteString(fmt.Sprintf("```%s\n%s\n```\n\n", ext, c.SuggestionCode))
+	}
+
+	return b.String()
+}
+
+func getFileExt(path string) string {
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '.' {
+			return path[i+1:]
+		}
+		if path[i] == '/' {
+			break
+		}
+	}
+	return ""
 }
 
 func getEnvWithDefault(key, defaultVal string) string {
