@@ -7,7 +7,11 @@ import (
 	"time"
 )
 
-const queueFilePath = "/data/ocr-queue.json"
+var queueFilePath = "/data/ocr-queue.json"
+
+func SetQueueFilePath(path string) {
+	queueFilePath = path
+}
 
 type ProjectInfo struct {
 	ID                int
