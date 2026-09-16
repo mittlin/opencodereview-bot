@@ -349,9 +349,8 @@ func cloneRepo(ctx context.Context, projectID int, projectPath, gitlabURL, gitla
 		return "", fmt.Errorf("git clone failed: %w, output: %s", err, string(output))
 	}
 
-	cmd = exec.CommandContext(ctx, "git", "-C", repoDir, "submodule", "update", "--init", "--recursive", "--depth", "50")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("Warning: submodule init failed: %v, output: %s", err, string(output))
+	if err := initSubmodulesWithAuth(ctx, repoDir, gitlabToken); err != nil {
+		log.Printf("Warning: submodule init failed: %v", err)
 	}
 
 	return repoDir, nil
@@ -393,6 +392,8 @@ func enumerateAndChunkFiles(ctx context.Context, repoDir string, excludes []stri
 }
 
 func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, files []string, cfg *Config, llmURL, llmToken, llmModel, language, maxTokensBudget, effort, provider string) ([]ReviewComment, string, error) {
+	// For chunked scanning, we use --include to specify files
+	// Also pass the global excludes from config
 	includeArg := strings.Join(files, ",")
 	outputFile := filepath.Join("/data/ocr-reviews", fmt.Sprintf("scan-%s-%d-%d.json",
 		strings.ReplaceAll(entry.PathWithNamespace, "/", "-"), entry.ProjectID, time.Now().Unix()))
@@ -405,6 +406,12 @@ func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, file
 		"--output", outputFile,
 		"--model", llmModel,
 		"--timeout", fmt.Sprintf("%d", cfg.ChunkTimeout),
+		"--no-plan", // Skip per-file PLAN_TASK pre-pass for faster scanning
+	}
+
+	// Add global excludes from config
+	if cfg.Excludes != "" {
+		args = append(args, "--exclude", cfg.Excludes)
 	}
 
 	if maxTokensBudget != "" {
