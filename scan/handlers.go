@@ -28,7 +28,14 @@ type IssueEvent struct {
 }
 
 func IssueHandler(w http.ResponseWriter, r *http.Request, event IssueEvent) {
+	log.Printf("Issue event received: project=%s action=%s iid=%d labels=%v",
+		event.Project.PathWithNamespace,
+		event.ObjectAttributes.Action,
+		event.ObjectAttributes.IID,
+		event.ObjectAttributes.Labels)
+
 	if event.ObjectAttributes.Action != "open" {
+		log.Printf("Skipping issue event: action=%s (only open handled)", event.ObjectAttributes.Action)
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": "action=" + event.ObjectAttributes.Action})
 		return
@@ -48,6 +55,7 @@ func IssueHandler(w http.ResponseWriter, r *http.Request, event IssueEvent) {
 	}
 
 	if !hasTriggerLabel {
+		log.Printf("Skipping issue event: no trigger label (labels=%v)", event.ObjectAttributes.Labels)
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": "no trigger label"})
 		return

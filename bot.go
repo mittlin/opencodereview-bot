@@ -336,6 +336,11 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid issue event", http.StatusBadRequest)
 			return
 		}
+		log.Printf("Webhook received: object_kind=issue project=%s action=%s iid=%d labels=%v",
+			event.Project.PathWithNamespace,
+			event.ObjectAttributes.Action,
+			event.ObjectAttributes.IID,
+			event.ObjectAttributes.Labels)
 		scan.IssueHandler(w, r, event)
 	default:
 		w.WriteHeader(http.StatusOK)
