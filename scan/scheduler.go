@@ -176,11 +176,17 @@ func runProjectScan(ctx context.Context, entry PriorityEntry, cfg *Config, botTo
 	var completedChunks []int
 
 	if queue.InProgress != nil && queue.InProgress.ProjectID == entry.ProjectID {
-		repoDir = queue.InProgress.RepoDir
+		// Resume: re-clone repo (temp dir doesn't survive restart)
+		log.Printf("Resuming project %s: %d/%d chunks done, re-cloning...", entry.PathWithNamespace, len(queue.InProgress.CompletedChunks), len(queue.InProgress.PendingChunks)+len(queue.InProgress.CompletedChunks))
+		repoDir, err = cloneRepo(ctx, entry.ProjectID, entry.PathWithNamespace, gitlabURLVal, gitlabTokenVal)
+		if err != nil {
+			return nil, fmt.Errorf("clone repo for resume: %w", err)
+		}
+		defer os.RemoveAll(repoDir)
+
 		chunks = queue.InProgress.PendingChunks
 		totalFiles = queue.InProgress.TotalFiles
 		completedChunks = queue.InProgress.CompletedChunks
-		log.Printf("Resuming project %s: %d/%d chunks done", entry.PathWithNamespace, len(completedChunks), len(chunks)+len(completedChunks))
 	} else {
 		log.Printf("Cloning repository for %s", entry.PathWithNamespace)
 		repoDir, err = cloneRepo(ctx, entry.ProjectID, entry.PathWithNamespace, gitlabURLVal, gitlabTokenVal)
@@ -224,7 +230,6 @@ func runProjectScan(ctx context.Context, entry PriorityEntry, cfg *Config, botTo
 				TriggerIssueIID:    entry.TriggerIssueIID,
 				TriggerType:        entry.TriggerType,
 				DefaultBranch:      "main",
-				RepoDir:            repoDir,
 			}
 			if err := SaveQueue(queue); err != nil {
 				log.Printf("Failed to save progress: %v", err)
@@ -257,7 +262,6 @@ func runProjectScan(ctx context.Context, entry PriorityEntry, cfg *Config, botTo
 			TriggerIssueIID:   entry.TriggerIssueIID,
 			TriggerType:       entry.TriggerType,
 			DefaultBranch:     "main",
-			RepoDir:           repoDir,
 		}
 		if err := SaveQueue(queue); err != nil {
 			log.Printf("Failed to save progress: %v", err)

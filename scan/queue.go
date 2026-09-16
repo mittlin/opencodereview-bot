@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-var queueFilePath = "/data/ocr-queue.json"
+var queueFilePath = "/data/ocr-reviews/ocr-queue.json"
 
 func SetQueueFilePath(path string) {
 	queueFilePath = path
@@ -39,7 +39,8 @@ type ScanProgress struct {
 	TriggerIssueIID    int
 	TriggerType        string
 	DefaultBranch      string
-	RepoDir            string
+	// RepoDir is NOT persisted - temp dir won't survive restart
+	// Re-clone on resume using ProjectID + PathWithNamespace
 }
 
 type NightlyQueue struct {
