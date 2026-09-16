@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/alibaba/open-code-review/internal/llm"
+	"github.com/alibaba/open-code-review/scan"
 )
 
 // ── Review request/response (existing) ──────────────────────────────────────
@@ -180,8 +181,20 @@ func main() {
 	http.HandleFunc("/health", healthHandler)
 	// Status endpoint for queue monitoring
 	http.HandleFunc("/status", statusHandler)
+	// Scan status endpoint
+	http.HandleFunc("/scan-status", scan.ScanStatusHandler)
 	// Single webhook endpoint - dispatches by object_kind
 	http.HandleFunc("/webhook", webhookMiddleware(webhookHandler))
+
+	// Start nightly scan scheduler if enabled
+	scanCfg := scan.LoadConfig()
+	if scanCfg.Enabled && scanCfg.GroupID != "" {
+		if err := scan.StartScheduler(context.Background(), botToken, gitlabURL, gitlabToken, llmURL, llmToken, llmModel, language, maxTokensBudget, effort, provider); err != nil {
+			log.Printf("Failed to start scan scheduler: %v", err)
+		}
+	} else if scanCfg.Enabled {
+		log.Println("Scan enabled but OCR_GROUP_ID not set, scheduler not started")
+	}
 
 	log.Printf("OpenCodeReview Bot starting on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
@@ -312,6 +325,13 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		releaseHandler(w, r, event)
+	case "issue":
+		var event scan.IssueEvent
+		if err := json.Unmarshal(body, &event); err != nil {
+			http.Error(w, "Invalid issue event", http.StatusBadRequest)
+			return
+		}
+		scan.IssueHandler(w, r, event)
 	default:
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": "unsupported event: " + peek.ObjectKind})
@@ -1068,6 +1088,15 @@ func convertComments(raw interface{}) []ReviewComment {
 func getEnvWithDefault(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
+	}
+	return defaultVal
+}
+
+func getEnvIntWithDefault(key string, defaultVal int) int {
+	if val := os.Getenv(key); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil {
+			return parsed
+		}
 	}
 	return defaultVal
 }

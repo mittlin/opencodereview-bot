@@ -15,6 +15,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/openai/openai-go/v3 v3.51.0
 	github.com/pkoukk/tiktoken-go v0.1.8
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	go.opentelemetry.io/otel v1.45.0

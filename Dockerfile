@@ -3,8 +3,10 @@ FROM docker.m.daocloud.io/library/golang:1.25-alpine AS builder
 WORKDIR /builder
 COPY upstream/ ./upstream/
 COPY bot.go ./upstream/bot.go
+COPY scan/ ./upstream/scan/
 ENV GOPROXY=https://goproxy.cn,direct
 RUN cd upstream && go mod download
+RUN cd upstream && go mod tidy
 RUN cd upstream && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../ocr ./cmd/opencodereview/
 RUN cd upstream && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../ocr-bot-server ./bot.go
 
