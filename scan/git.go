@@ -9,13 +9,76 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
-// initSubmodulesWithAuth reads .gitmodules, builds insteadOf rules to inject
+// CloneRepo clones a repository with optional branch/fetch/checkout.
+// sourceBranch: if non-empty, adds --branch to clone.
+// targetBranch: if non-empty, runs git fetch origin <targetBranch>.
+// commitSHA: if non-empty, runs git checkout <commitSHA>.
+// Calls InitSubmodulesWithAuth at the end.
+func CloneRepo(ctx context.Context, projectID int, projectPath, gitlabURLVal, gitlabTokenVal,
+	sourceBranch, targetBranch, commitSHA string) (string, error) {
+
+	repoDir := fmt.Sprintf("/tmp/ocr-repo-%d-%d", projectID, time.Now().UnixNano())
+
+	// Build clone URL with group token
+	gitlabCloneURL := gitlabURLVal
+	if gitlabTokenVal != "" {
+		prefix := "http://"
+		suffix := gitlabURLVal
+		if strings.HasPrefix(gitlabURLVal, "https://") {
+			prefix = "https://"
+			suffix = strings.TrimPrefix(gitlabURLVal, "https://")
+		} else {
+			suffix = strings.TrimPrefix(gitlabURLVal, "http://")
+		}
+		gitlabCloneURL = prefix + "oauth2:" + gitlabTokenVal + "@" + suffix
+	}
+
+	gitlabCloneURL = gitlabCloneURL + "/" + projectPath + ".git"
+
+	// Clone
+	args := []string{"clone", "--depth", "50"}
+	if sourceBranch != "" {
+		args = append(args, "--branch", sourceBranch)
+	}
+	args = append(args, gitlabCloneURL, repoDir)
+
+	cmd := exec.CommandContext(ctx, "git", args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git clone failed: %w, output: %s", err, string(output))
+	}
+
+	// Fetch target branch if specified
+	if targetBranch != "" {
+		cmd = exec.CommandContext(ctx, "git", "-C", repoDir, "fetch", "origin", targetBranch)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("git fetch target failed: %w, output: %s", err, string(output))
+		}
+	}
+
+	// Checkout commit if specified
+	if commitSHA != "" {
+		cmd = exec.CommandContext(ctx, "git", "-C", repoDir, "checkout", commitSHA)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("git checkout target commit failed: %w, output: %s", err, string(output))
+		}
+	}
+
+	// Init submodules with insteadOf config to inject token into submodule URLs
+	if err := InitSubmodulesWithAuth(ctx, repoDir, gitlabTokenVal); err != nil {
+		log.Printf("Warning: submodule init failed: %v", err)
+	}
+
+	return repoDir, nil
+}
+
+// InitSubmodulesWithAuth reads .gitmodules, builds insteadOf rules to inject
 // the GitLab token into submodule URLs, and runs submodule update.
 // Uses GIT_CONFIG_GLOBAL with a temp file so child processes (git clone for
 // submodules) inherit the insteadOf rules.
-func initSubmodulesWithAuth(ctx context.Context, repoDir, gitlabToken string) error {
+func InitSubmodulesWithAuth(ctx context.Context, repoDir, gitlabToken string) error {
 	if gitlabToken == "" {
 		// No token — try plain submodule update
 		cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "submodule", "update", "--init", "--recursive", "--depth", "50")

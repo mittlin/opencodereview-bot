@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,18 +44,8 @@ type ReviewResponse struct {
 	Error    string          `json:"error,omitempty"`
 }
 
-type ReviewComment struct {
-	File            string `json:"file"`
-	Line            int    `json:"line"`
-	EndLine         int    `json:"end_line"`
-	Message         string `json:"message"`
-	SuggestionCode  string `json:"suggestion_code"`
-	ExistingCode    string `json:"existing_code"`
-	Severity        string `json:"severity"`
-	Category        string `json:"category"`
-	Thinking        string `json:"thinking"`
-	Tool            string `json:"tool"`
-}
+// ReviewComment is an alias for scan.ReviewComment (single source of truth).
+type ReviewComment = scan.ReviewComment
 
 // ── GitLab Webhook event structs ────────────────────────────────────────────
 
@@ -141,13 +129,13 @@ func main() {
 	llmURL = os.Getenv("LLM_URL")
 	llmToken = os.Getenv("LLM_TOKEN")
 	llmModel = os.Getenv("LLM_MODEL")
-	language = getEnvWithDefault("OCR_LANGUAGE", "Chinese")
-	llmTimeout = getEnvWithDefault("OCR_LLM_TIMEOUT", "900")
-	reviewTimeout = getEnvWithDefault("OCR_REVIEW_TIMEOUT", "60")
-	perFileTimeout = getEnvWithDefault("OCR_PER_FILE_TIMEOUT", "30")
-	maxTokensBudget = getEnvWithDefault("OCR_MAX_TOKENS_BUDGET", "")
-	effort = getEnvWithDefault("OCR_EFFORT", "")
-	provider = getEnvWithDefault("OCR_PROVIDER", "")
+	language = scan.GetEnvWithDefault("OCR_LANGUAGE", "Chinese")
+	llmTimeout = scan.GetEnvWithDefault("OCR_LLM_TIMEOUT", "900")
+	reviewTimeout = scan.GetEnvWithDefault("OCR_REVIEW_TIMEOUT", "60")
+	perFileTimeout = scan.GetEnvWithDefault("OCR_PER_FILE_TIMEOUT", "30")
+	maxTokensBudget = scan.GetEnvWithDefault("OCR_MAX_TOKENS_BUDGET", "")
+	effort = scan.GetEnvWithDefault("OCR_EFFORT", "")
+	provider = scan.GetEnvWithDefault("OCR_PROVIDER", "")
 
 	if botToken == "" {
 		log.Fatal("BOT_TOKEN is required")
@@ -519,7 +507,6 @@ func releaseHandler(w http.ResponseWriter, r *http.Request, event ReleaseEvent) 
 
 const (
 	outputDir = "/data/ocr-reviews"
-	homeDir   = "/data/ocr-home"
 )
 
 func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) {
@@ -531,7 +518,7 @@ func runReview(ctx context.Context, req ReviewRequest) (*ReviewResponse, error) 
 		repoDir = req.LocalRepo
 		cleanup = func() {}
 	} else {
-		repoDir, err = cloneRepo(ctx, req)
+		repoDir, err = scan.CloneRepo(ctx, req.ProjectID, req.ProjectPath, gitlabURL, gitlabToken, req.SourceBranch, req.TargetBranch, req.CommitSHA)
 		if err != nil {
 			return nil, fmt.Errorf("clone repo: %w", err)
 		}
@@ -548,7 +535,7 @@ func runReviewWithRepoDir(ctx context.Context, req ReviewRequest, repoDir string
 	// Ensure safe.directory for local repos
 	if req.LocalRepo != "" {
 		safeCmd := exec.CommandContext(ctx, "git", "config", "--global", "--add", "safe.directory", repoDir)
-		safeCmd.Env = append(os.Environ(), "HOME="+homeDir)
+		safeCmd.Env = append(os.Environ(), "HOME="+scan.OCRHomeDir)
 		if out, err := safeCmd.CombinedOutput(); err != nil {
 			log.Printf("Warning: git config safe.directory failed: %v, output: %s", err, string(out))
 		}
@@ -590,55 +577,18 @@ func runReviewWithRepoDir(ctx context.Context, req ReviewRequest, repoDir string
 	}
 
 	if len(req.IncludePaths) > 0 {
-		args = append(args, "--include", strings.Join(req.IncludePaths, ","))
+		args = append(args, "--path", strings.Join(req.IncludePaths, ","))
 	}
 	if len(req.ExcludePaths) > 0 {
 		args = append(args, "--exclude", strings.Join(req.ExcludePaths, ","))
 	}
 
-	if maxTokensBudget != "" {
-		args = append(args, "--max-tokens-budget", maxTokensBudget)
-	}
-	if effort != "" {
-		args = append(args, "--effort", effort)
-	}
-	if provider != "" {
-		args = append(args, "--provider", provider)
-	}
+	args = scan.AppendOCRArgs(args, maxTokensBudget, effort, provider)
 
-	cmd := exec.CommandContext(ctx, "/usr/local/bin/ocr", args...)
-	cmd.Env = append(os.Environ(),
-		"OCR_LLM_URL="+llmURL,
-		"OCR_LLM_TOKEN="+llmToken,
-		"OCR_LLM_MODEL="+llmModel,
-		"OCR_LLM_TIMEOUT="+llmTimeout,
-		"HOME="+homeDir,
-	)
-
-	var stderr bytes.Buffer
-	cmd.Stdout = nil
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
+	env := scan.BuildOCREnv(llmURL, llmToken, llmModel, "OCR_LLM_TIMEOUT", llmTimeout)
+	comments, summary, err := scan.RunOCR(ctx, args, env, outputPath)
 	if err != nil {
-		log.Printf("OCR stderr: %s", stderr.String())
-		return nil, fmt.Errorf("ocr review failed: %w, stderr: %s", err, stderr.String())
-	}
-
-	data, err := os.ReadFile(outputPath)
-	if err != nil {
-		return nil, fmt.Errorf("read ocr output file: %w", err)
-	}
-
-	var ocrResult map[string]interface{}
-	if err := json.Unmarshal(data, &ocrResult); err != nil {
-		return nil, fmt.Errorf("parse ocr output file: %w, content: %s", err, string(data))
-	}
-
-	comments := convertComments(ocrResult["comments"])
-	summary := ""
-	if m := ocrResult["message"]; m != nil {
-		summary = m.(string)
+		return nil, err
 	}
 
 	return &ReviewResponse{
@@ -694,7 +644,7 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 		repoDir = req.LocalRepo
 		cleanup = func() {}
 	} else {
-		repoDir, err = cloneRepo(ctx, req)
+		repoDir, err = scan.CloneRepo(ctx, projectID, projectPath, gitlabURL, gitlabToken, sourceBranch, targetBranch, toSHA)
 		if err != nil {
 			log.Printf("Review error: project=%s from=%s to=%s clone failed: %v",
 				displayProject, fromSHA, toSHA, err)
@@ -717,57 +667,6 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 }
 
 // ── Git operations ──────────────────────────────────────────────────────────
-
-func cloneRepo(ctx context.Context, req ReviewRequest) (string, error) {
-	repoDir := fmt.Sprintf("/tmp/ocr-repo-%d-%d", req.ProjectID, time.Now().UnixNano())
-
-	// Build clone URL with group token
-	gitlabCloneURL := gitlabURL
-	if gitlabToken != "" {
-		// http://oauth2:<token>@host/group/project.git
-		prefix := "http://"
-		suffix := gitlabURL
-		if strings.HasPrefix(gitlabURL, "https://") {
-			prefix = "https://"
-			suffix = strings.TrimPrefix(gitlabURL, "https://")
-		} else {
-			suffix = strings.TrimPrefix(gitlabURL, "http://")
-		}
-		gitlabCloneURL = prefix + "oauth2:" + gitlabToken + "@" + suffix
-	}
-
-	if req.ProjectPath != "" {
-		gitlabCloneURL = gitlabCloneURL + "/" + req.ProjectPath + ".git"
-	} else {
-		gitlabCloneURL = gitlabCloneURL + "/" + fmt.Sprintf("%d.git", req.ProjectID)
-	}
-
-	// Clone main repo without --recurse-submodules to avoid submodule auth failures
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "50", "--branch", req.SourceBranch, gitlabCloneURL, repoDir)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("git clone failed: %w, output: %s", err, string(output))
-	}
-
-	cmd = exec.CommandContext(ctx, "git", "-C", repoDir, "fetch", "origin", req.TargetBranch)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("git fetch target failed: %w, output: %s", err, string(output))
-	}
-
-	// Checkout target commit so submodules update to the correct versions
-	if req.CommitSHA != "" {
-		cmd = exec.CommandContext(ctx, "git", "-C", repoDir, "checkout", req.CommitSHA)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return "", fmt.Errorf("git checkout target commit failed: %w, output: %s", err, string(output))
-		}
-	}
-
-	// Init submodules with insteadOf config to inject token into submodule URLs
-	if err := initSubmodulesWithAuth(ctx, repoDir); err != nil {
-		log.Printf("Warning: submodule init failed: %v", err)
-	}
-
-	return repoDir, nil
-}
 
 // buildFileToCommitMap runs git log --name-only from..to and returns
 // a map of filePath -> lastCommitSHA that modified that file in the range.
@@ -817,109 +716,6 @@ func isHexString(s string) bool {
 		}
 	}
 	return true
-}
-
-// initSubmodulesWithAuth reads .gitmodules, builds insteadOf rules to inject
-// the GitLab token into submodule URLs, and runs submodule update.
-// Uses GIT_CONFIG_GLOBAL with a temp file so child processes (git clone for
-// submodules) inherit the insteadOf rules.
-func initSubmodulesWithAuth(ctx context.Context, repoDir string) error {
-	if gitlabToken == "" {
-		// No token — try plain submodule update
-		cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "submodule", "update", "--init", "--recursive", "--depth", "50")
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("git submodule update failed: %w, output: %s", err, string(output))
-		}
-		logSubmoduleStatus(ctx, repoDir)
-		return nil
-	}
-
-	// Parse .gitmodules to find unique (scheme, host) pairs needing auth
-	hosts := parseGitmodulesHosts(repoDir)
-	if len(hosts) == 0 {
-		return nil
-	}
-
-	// Build a temporary git config file with insteadOf rules
-	var cfg strings.Builder
-	for _, h := range hosts {
-		// scheme://HOST/ → scheme://oauth2:TOKEN@HOST/
-		src := h.scheme + "://" + h.host + "/"
-		dst := h.scheme + "://oauth2:" + gitlabToken + "@" + h.host + "/"
-		fmt.Fprintf(&cfg, "[url \"%s\"]\n\tinsteadOf = %s\n", dst, src)
-	}
-
-	tmpFile, err := os.CreateTemp("", "ocr-gitconfig-*")
-	if err != nil {
-		return fmt.Errorf("create temp git config: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := tmpFile.WriteString(cfg.String()); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("write temp git config: %w", err)
-	}
-	tmpFile.Close()
-
-	// GIT_CONFIG_GLOBAL makes all child processes (including git clone for
-	// submodules) inherit the insteadOf rules.
-	env := os.Environ()
-	env = append(env, "GIT_CONFIG_GLOBAL="+tmpPath)
-
-	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "submodule", "update", "--init", "--recursive", "--depth", "50")
-	cmd.Env = env
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git submodule update failed: %w, output: %s", err, string(output))
-	}
-	logSubmoduleStatus(ctx, repoDir)
-	return nil
-}
-
-// logSubmoduleStatus logs the status of all submodules after update.
-func logSubmoduleStatus(ctx context.Context, repoDir string) {
-	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "submodule", "status", "--recursive")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("[submodule] status check failed: %v, output: %s", err, string(output))
-	} else {
-		log.Printf("[submodule] status:\n%s", string(output))
-	}
-}
-
-// submoduleHost holds scheme and host for a submodule URL.
-type submoduleHost struct {
-	scheme string // "http" or "https"
-	host   string // hostname without port/path
-}
-
-// parseGitmodulesHosts extracts unique (scheme, host) pairs from .gitmodules URLs.
-func parseGitmodulesHosts(repoDir string) []submoduleHost {
-	data, err := os.ReadFile(filepath.Join(repoDir, ".gitmodules"))
-	if err != nil {
-		return nil
-	}
-	seen := make(map[string]bool)
-	var hosts []submoduleHost
-	// Match: url = <scheme>://<host>[:port]/<path> or url = <scheme>://<user>@<host>[:port]/<path>
-	re := regexp.MustCompile(`(?i)^\s*url\s*=\s*(\w+)://(?:[^/@]+@)?([^/:]+)`)
-	for line := range strings.SplitSeq(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "url") {
-			continue
-		}
-		matches := re.FindStringSubmatch(line)
-		if len(matches) != 3 {
-			continue
-		}
-		scheme := strings.ToLower(matches[1])
-		host := matches[2]
-		key := scheme + "://" + host
-		if host != "" && !seen[key] {
-			seen[key] = true
-			hosts = append(hosts, submoduleHost{scheme: scheme, host: host})
-		}
-	}
-	return hosts
 }
 
 func getTagCommitSHA(projectID int, tagName string) (string, error) {
@@ -1004,7 +800,7 @@ func postCommentsToMR(projectID, mrIID int, comments []ReviewComment, projectPat
 		url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d/discussions", gitlabURL, projectID, mrIID)
 
 		body := map[string]interface{}{
-			"body": formatCommentBody(comment, gitlabURL, projectPath, defaultBranch),
+			"body": scan.FormatCommentBody(comment, gitlabURL, projectPath, defaultBranch),
 			"position": map[string]interface{}{
 				"position_type": "text",
 				"new_path":      comment.File,
@@ -1038,7 +834,7 @@ func postCommentsToCommit(projectID int, commitSHA string, comments []ReviewComm
 		url := fmt.Sprintf("%s/api/v4/projects/%d/repository/commits/%s/discussions", gitlabURL, projectID, commitSHA)
 
 		body := map[string]interface{}{
-			"body": formatCommentBody(comment, gitlabURL, projectPath, defaultBranch),
+			"body": scan.FormatCommentBody(comment, gitlabURL, projectPath, defaultBranch),
 		}
 
 		jsonBody, _ := json.Marshal(body)
@@ -1058,122 +854,3 @@ func postCommentsToCommit(projectID int, commitSHA string, comments []ReviewComm
 }
 
 // ── Utilities ───────────────────────────────────────────────────────────────
-
-func convertComments(raw interface{}) []ReviewComment {
-	comments := []ReviewComment{}
-	commentsList, ok := raw.([]interface{})
-	if !ok {
-		return comments
-	}
-
-	for _, c := range commentsList {
-		cm, ok := c.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		comments = append(comments, ReviewComment{
-			File:            getString(cm, "path"),
-			Line:            getInt(cm, "start_line"),
-			EndLine:         getInt(cm, "end_line"),
-			Message:         getString(cm, "content"),
-			SuggestionCode:  getString(cm, "suggestion_code"),
-			ExistingCode:    getString(cm, "existing_code"),
-			Severity:        getString(cm, "severity"),
-			Category:        getString(cm, "category"),
-			Thinking:        getString(cm, "thinking"),
-			Tool:            "code_review",
-		})
-	}
-	return comments
-}
-
-// formatCommentBody creates a rich markdown body for GitLab comments
-func formatCommentBody(c ReviewComment, gitlabURL, projectPath, defaultBranch string) string {
-	var b strings.Builder
-
-	// File link with line range
-	codeLink := fmt.Sprintf("[%s:%d-%d](%s/%s/-/blob/%s/%s#L%d-L%d)",
-		c.File, c.Line, c.EndLine, gitlabURL, projectPath, defaultBranch, c.File, c.Line, c.EndLine)
-
-	// Header with severity and category badges
-	sev := strings.ToUpper(c.Severity)
-	cat := c.Category
-	if cat == "" {
-		cat = "general"
-	}
-	b.WriteString(fmt.Sprintf("**%s** [%s] (%s)\n\n", codeLink, sev, cat))
-
-	// Main message
-	if c.Message != "" {
-		b.WriteString(fmt.Sprintf("%s\n\n", c.Message))
-	}
-
-	// Thinking (collapsible)
-	if c.Thinking != "" {
-		b.WriteString("<details>\n<summary><strong>Analysis</strong></summary>\n\n")
-		b.WriteString(fmt.Sprintf("%s\n\n", c.Thinking))
-		b.WriteString("</details>\n\n")
-	}
-
-	// Existing code
-	if c.ExistingCode != "" {
-		b.WriteString("**Existing Code:**\n")
-		ext := getFileExt(c.File)
-		b.WriteString(fmt.Sprintf("```%s\n%s\n```\n\n", ext, c.ExistingCode))
-	}
-
-	// Suggestion code
-	if c.SuggestionCode != "" {
-		b.WriteString("**Suggestion:**\n")
-		ext := getFileExt(c.File)
-		b.WriteString(fmt.Sprintf("```%s\n%s\n```\n\n", ext, c.SuggestionCode))
-	}
-
-	return b.String()
-}
-
-func getFileExt(path string) string {
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '.' {
-			return path[i+1:]
-		}
-		if path[i] == '/' {
-			break
-		}
-	}
-	return ""
-}
-
-func getEnvWithDefault(key, defaultVal string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
-	}
-	return defaultVal
-}
-
-func getEnvIntWithDefault(key string, defaultVal int) int {
-	if val := os.Getenv(key); val != "" {
-		if parsed, err := strconv.Atoi(val); err == nil {
-			return parsed
-		}
-	}
-	return defaultVal
-}
-
-func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key].(string); ok {
-		return v
-	}
-	return ""
-}
-
-func getInt(m map[string]interface{}, key string) int {
-	if v, ok := m[key].(float64); ok {
-		return int(v)
-	}
-	if v, ok := m[key].(int); ok {
-		return v
-	}
-	return 0
-}

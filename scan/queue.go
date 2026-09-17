@@ -74,14 +74,6 @@ type ScanResult struct {
 	Error         error
 }
 
-type ReviewComment struct {
-	File     string `json:"file"`
-	Line     int    `json:"line"`
-	Message  string `json:"message"`
-	Severity string `json:"severity"`
-	Tool     string `json:"tool"`
-}
-
 type GitLabIssue struct {
 	IID    int      `json:"iid"`
 	Title  string   `json:"title"`

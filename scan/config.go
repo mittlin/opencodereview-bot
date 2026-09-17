@@ -30,29 +30,29 @@ type Config struct {
 }
 
 func LoadConfig() *Config {
-	triggerLabelsStr := getEnvWithDefault("OCR_ISSUE_TRIGGER_LABELS", "ocr-scan,ocr-trigger")
+	triggerLabelsStr := GetEnvWithDefault("OCR_ISSUE_TRIGGER_LABELS", "ocr-scan,ocr-trigger")
 	triggerLabels := strings.Split(triggerLabelsStr, ",")
 	for i := range triggerLabels {
 		triggerLabels[i] = strings.TrimSpace(triggerLabels[i])
 	}
 
 	return &Config{
-		Enabled:                getEnvWithDefault("OCR_SCAN_ENABLED", "true") == "true",
-		CronExpr:               getEnvWithDefault("OCR_SCHEDULE_CRON", "0 21 * * *"),
-		WindowEnd:              getEnvWithDefault("OCR_SCAN_WINDOW_END", "08:00"),
-		GroupID:                getEnvWithDefault("OCR_GROUP_ID", ""),
-		Paths:                  getEnvWithDefault("OCR_SCAN_PATHS", ""),
-		Excludes:               getEnvWithDefault("OCR_SCAN_EXCLUDES", "**/generated/*,**/testdata/*,**/vendor/*"),
+		Enabled:                GetEnvWithDefault("OCR_SCAN_ENABLED", "true") == "true",
+		CronExpr:               GetEnvWithDefault("OCR_SCHEDULE_CRON", "0 21 * * *"),
+		WindowEnd:              GetEnvWithDefault("OCR_SCAN_WINDOW_END", "08:00"),
+		GroupID:                GetEnvWithDefault("OCR_GROUP_ID", ""),
+		Paths:                  GetEnvWithDefault("OCR_SCAN_PATHS", ""),
+		Excludes:               GetEnvWithDefault("OCR_SCAN_EXCLUDES", "**/generated/*,**/testdata/*,**/vendor/*"),
 		ChunkSize:              getEnvIntWithDefault("OCR_SCAN_CHUNK_SIZE", 500),
 		ChunkTimeout:           getEnvIntWithDefault("OCR_SCAN_CHUNK_TIMEOUT", 30),
 		HardDeadlineBuffer:     getEnvIntWithDefault("OCR_SCAN_HARD_DEADLINE_BUFFER", 30),
-		CreateIssues:           getEnvWithDefault("OCR_CREATE_ISSUES", "true") == "true",
-		IssueLabel:             getEnvWithDefault("OCR_ISSUE_LABEL", "ocr-review"),
-		IssueTitlePrefix:       getEnvWithDefault("OCR_ISSUE_TITLE_PREFIX", "[OCR] "),
-		SeverityThreshold:      getEnvWithDefault("OCR_ISSUE_SEVERITY_THRESHOLD", "warning"),
+		CreateIssues:           GetEnvWithDefault("OCR_CREATE_ISSUES", "true") == "true",
+		IssueLabel:             GetEnvWithDefault("OCR_ISSUE_LABEL", "ocr-review"),
+		IssueTitlePrefix:       GetEnvWithDefault("OCR_ISSUE_TITLE_PREFIX", "[OCR] "),
+		SeverityThreshold:      GetEnvWithDefault("OCR_ISSUE_SEVERITY_THRESHOLD", "warning"),
 		TriggerLabels:          triggerLabels,
-		AutoCloseOnCleanRescan: getEnvWithDefault("OCR_AUTO_CLOSE_ON_CLEAN_RESCAN", "true") == "true",
-		RescanTriggerPhrase:    getEnvWithDefault("OCR_RESCAN_TRIGGER_PHRASE", "@ocr-bot review"),
+		AutoCloseOnCleanRescan: GetEnvWithDefault("OCR_AUTO_CLOSE_ON_CLEAN_RESCAN", "true") == "true",
+		RescanTriggerPhrase:    GetEnvWithDefault("OCR_RESCAN_TRIGGER_PHRASE", "@ocr-bot review"),
 	}
 }
 
@@ -88,7 +88,9 @@ func ConfigLLM(ctx context.Context) {
 	}
 }
 
-func getEnvWithDefault(key, defaultVal string) string {
+// GetEnvWithDefault returns the value of the environment variable named by key,
+// or defaultVal if the variable is empty or not set.
+func GetEnvWithDefault(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
 	}
