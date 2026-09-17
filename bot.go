@@ -380,6 +380,7 @@ func reviewHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	result.Comments = scan.SortCommentsBySeverity(result.Comments)
 	json.NewEncoder(w).Encode(result)
 }
 
@@ -796,6 +797,7 @@ func postCommentsToMR(projectID, mrIID int, comments []ReviewComment, projectPat
 		return
 	}
 
+	comments = scan.SortCommentsBySeverity(comments)
 	for _, comment := range comments {
 		url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d/discussions", gitlabURL, projectID, mrIID)
 
@@ -830,6 +832,7 @@ func postCommentsToCommit(projectID int, commitSHA string, comments []ReviewComm
 		return
 	}
 
+	comments = scan.SortCommentsBySeverity(comments)
 	for _, comment := range comments {
 		url := fmt.Sprintf("%s/api/v4/projects/%d/repository/commits/%s/discussions", gitlabURL, projectID, commitSHA)
 
