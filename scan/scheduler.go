@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -327,26 +328,100 @@ func buildIssueBody(comments []ReviewComment, summary, projectPath, defaultBranc
 	return FormatIssueBody(comments, summary, projectPath, defaultBranch, gitlabURL, triggerIssueIID)
 }
 
+// buildSummaryComment creates the summary table posted on the trigger issue.
+func buildSummaryComment(byFile map[string][]ReviewComment, fileIssues map[string]int, gitlabURL, projectPath, defaultBranch string) string {
+	var b strings.Builder
+	totalFindings := 0
+	for _, cs := range byFile {
+		totalFindings += len(cs)
+	}
+	b.WriteString(fmt.Sprintf("🔗 **Scan complete** — %d findings across %d files\n\n", totalFindings, len(byFile)))
+	b.WriteString("| File | Findings | Severity | Issue |\n")
+	b.WriteString("|------|----------|----------|-------|\n")
+
+	// Sort files alphabetically
+	files := make([]string, 0, len(byFile))
+	for f := range byFile {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+
+	for _, file := range files {
+		cs := byFile[file]
+		baseName := GetFileBaseName(file)
+		fileLink := fmt.Sprintf("[%s](%s/%s/-/blob/%s/%s)", baseName, gitlabURL, projectPath, defaultBranch, file)
+
+		// Count severities
+		var hi, med, lo int
+		for _, c := range cs {
+			switch strings.ToLower(c.Severity) {
+			case "critical", "high":
+				hi++
+			case "medium":
+				med++
+			case "low":
+				lo++
+			}
+		}
+		sevStr := fmt.Sprintf("H:%d M:%d L:%d", hi, med, lo)
+
+		issueIID := fileIssues[file]
+		issueLink := "—"
+		if issueIID > 0 {
+			issueLink = fmt.Sprintf("#%d", issueIID)
+		}
+
+		b.WriteString(fmt.Sprintf("| %s | %d | %s | %s |\n", fileLink, len(cs), sevStr, issueLink))
+	}
+	return b.String()
+}
+
 // scanChunksAndReport handles the shared post-scan logic for both nightly and immediate scans:
-// create issue, comment on trigger issue, auto-close on clean scan.
+// create per-file issues, close stale issues, post summary on trigger issue.
 func scanChunksAndReport(ctx context.Context, entry PriorityEntry, cfg *Config, allComments []ReviewComment, allSummaries []string, scanSuccessful bool, gitlabURLVal, reportTitle string) (*scanProgressResult, error) {
 	aggregatedSummary := strings.Join(allSummaries, "\n\n")
 
-	title := fmt.Sprintf("%s%s - %s", cfg.IssueTitlePrefix, reportTitle, entry.PathWithNamespace)
-	body := buildIssueBody(allComments, aggregatedSummary, entry.PathWithNamespace, "main", gitlabURLVal, entry.TriggerIssueIID)
-
 	issueIID := 0
+	fileIssues := map[string]int{}
+
 	if cfg.CreateIssues && len(allComments) > 0 {
-		var err error
-		issueIID, err = CreateOrUpdateScanIssue(ctx, entry.ProjectID, title, body, []string{}, entry.TriggerIssueIID)
-		if err != nil {
-			log.Printf("Failed to create issue: %v", err)
-		} else {
-			log.Printf("Created scan result issue #%d for %s", issueIID, entry.PathWithNamespace)
-			if entry.TriggerIssueIID > 0 {
-				linkMsg := fmt.Sprintf("🔗 Scan results available in issue #%d", issueIID)
-				AddCommentToIssue(ctx, entry.ProjectID, entry.TriggerIssueIID, linkMsg)
+		// Group by file
+		byFile := map[string][]ReviewComment{}
+		for _, c := range allComments {
+			byFile[c.File] = append(byFile[c.File], c)
+		}
+
+		keepLabels := map[string]bool{}
+		for filePath, fileComments := range byFile {
+			fileBody := FormatFileIssueBody(fileComments, filePath, entry.PathWithNamespace, "main", gitlabURLVal)
+			fiid, err := CreateOrUpdateFileIssue(ctx, entry.ProjectID, filePath, fileBody, entry.TriggerIssueIID)
+			if err != nil {
+				log.Printf("Failed to create file issue for %s: %v", filePath, err)
+			} else {
+				fileIssues[filePath] = fiid
+				baseName := GetFileBaseName(filePath)
+				keepLabels["file:"+baseName] = true
+				log.Printf("Created file issue #%d for %s (%d findings)", fiid, filePath, len(fileComments))
 			}
+		}
+
+		// Close stale file issues
+		if err := CloseStaleFileIssues(ctx, entry.ProjectID, keepLabels); err != nil {
+			log.Printf("Failed to close stale file issues: %v", err)
+		}
+
+		// Post summary comment on trigger issue
+		if entry.TriggerIssueIID > 0 {
+			summaryComment := buildSummaryComment(byFile, fileIssues, gitlabURLVal, entry.PathWithNamespace, "main")
+			if err := AddCommentToIssue(ctx, entry.ProjectID, entry.TriggerIssueIID, summaryComment); err != nil {
+				log.Printf("Failed to add summary comment: %v", err)
+			}
+		}
+
+		// For backward compat, use first file's IID as the "main" issue
+		for _, fiid := range fileIssues {
+			issueIID = fiid
+			break
 		}
 	} else if len(allComments) == 0 && entry.TriggerIssueIID > 0 && scanSuccessful {
 		msg := "✅ Scan completed - no issues found"
@@ -354,9 +429,10 @@ func scanChunksAndReport(ctx context.Context, entry PriorityEntry, cfg *Config, 
 			log.Printf("Failed to add clean scan comment: %v", err)
 		}
 		if cfg.AutoCloseOnCleanRescan {
-			log.Printf("Auto-closing issue #%d (clean scan, auto-close enabled)", entry.TriggerIssueIID)
-			if err := CloseIssue(ctx, entry.ProjectID, entry.TriggerIssueIID); err != nil {
-				log.Printf("Failed to auto-close issue: %v", err)
+			// Close all open file issues for this project
+			log.Printf("Auto-closing all file issues for project %s (clean scan)", entry.PathWithNamespace)
+			if err := CloseStaleFileIssues(ctx, entry.ProjectID, map[string]bool{}); err != nil {
+				log.Printf("Failed to close file issues: %v", err)
 			}
 		}
 	}

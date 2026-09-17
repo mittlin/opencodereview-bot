@@ -213,6 +213,98 @@ func CreateOrUpdateScanIssue(ctx context.Context, projectID int, title, body str
 	return CreateIssue(ctx, projectID, title, body, ocrLabels)
 }
 
+// GetFileBaseName returns the last component of a file path.
+func GetFileBaseName(filePath string) string {
+	if i := strings.LastIndex(filePath, "/"); i >= 0 {
+		return filePath[i+1:]
+	}
+	return filePath
+}
+
+// FindExistingFileIssues returns all open issues with ocr-result + nightly-scan labels.
+func FindExistingFileIssues(ctx context.Context, projectID int) ([]GitLabIssue, error) {
+	labels := "ocr-result,nightly-scan"
+	url := fmt.Sprintf("%s/api/v4/projects/%d/issues?labels=%s&state=opened&per_page=100", gitlabURL, projectID, labels)
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req.Header.Set("PRIVATE-TOKEN", gitlabToken)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("find existing file issues: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("find existing file issues: status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var issues []GitLabIssue
+	if err := json.NewDecoder(resp.Body).Decode(&issues); err != nil {
+		return nil, fmt.Errorf("decode file issues: %w", err)
+	}
+	return issues, nil
+}
+
+// CreateOrUpdateFileIssue creates or updates a per-file scan issue.
+// Labels: ocr-result, nightly-scan, file:<basename>
+func CreateOrUpdateFileIssue(ctx context.Context, projectID int, filePath, body string, triggerIssueIID int) (int, error) {
+	baseName := GetFileBaseName(filePath)
+	fileLabel := "file:" + baseName
+	ocrLabels := []string{"ocr-result", "nightly-scan", fileLabel}
+
+	existing, err := FindExistingOCRIssue(ctx, projectID, ocrLabels)
+	if err != nil {
+		return 0, err
+	}
+
+	if existing != nil {
+		linkMsg := fmt.Sprintf("🔄 Updated by new scan (triggered by #%d)", triggerIssueIID)
+		if err := AddCommentToIssue(ctx, projectID, existing.IID, linkMsg); err != nil {
+			log.Printf("Failed to add update comment: %v", err)
+		}
+		if err := CloseIssue(ctx, projectID, existing.IID); err != nil {
+			log.Printf("Failed to close old issue: %v", err)
+		}
+	}
+
+	title := fmt.Sprintf("[OCR] %s - findings", baseName)
+	return CreateIssue(ctx, projectID, title, body, ocrLabels)
+}
+
+// CloseStaleFileIssues closes open ocr-result issues that are NOT in keepLabels.
+func CloseStaleFileIssues(ctx context.Context, projectID int, keepLabels map[string]bool) error {
+	existing, err := FindExistingFileIssues(ctx, projectID)
+	if err != nil {
+		return err
+	}
+
+	closed := 0
+	for _, issue := range existing {
+		shouldKeep := false
+		for _, label := range issue.Labels {
+			if strings.HasPrefix(label, "file:") && keepLabels[label] {
+				shouldKeep = true
+				break
+			}
+		}
+		if !shouldKeep {
+			if err := CloseIssue(ctx, projectID, issue.IID); err != nil {
+				log.Printf("Failed to close stale issue #%d: %v", issue.IID, err)
+			} else {
+				log.Printf("Closed stale file issue #%d (%s)", issue.IID, issue.Title)
+				closed++
+			}
+		}
+	}
+	if closed > 0 {
+		log.Printf("Closed %d stale file issues for project %d", closed, projectID)
+	}
+	return nil
+}
+
 func TriggerRescanOnComment(ctx context.Context, projectID int, pathWithNamespace string, issueIID int) error {
 	log.Printf("Queuing rescan for %s (trigger issue #%d)", pathWithNamespace, issueIID)
 

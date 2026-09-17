@@ -69,6 +69,7 @@ type CompletedEntry struct {
 	PathWithNamespace   string
 	Findings            int
 	IssueIID            int
+	FileIssues          map[string]int `json:"file_issues,omitempty"`
 	CompletedAt         time.Time
 }
 
