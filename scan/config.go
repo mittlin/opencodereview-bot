@@ -1,7 +1,11 @@
 package scan
 
 import (
+	"context"
+	"encoding/json"
+	"log"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -52,11 +56,52 @@ func LoadConfig() *Config {
 	}
 }
 
+const OCRHomeDir = "/data/ocr-home"
+
+// ConfigLLM writes OCR LLM settings to config.json via `ocr config set`.
+// Reads from environment variables (same as bot.go startup config).
+func ConfigLLM(ctx context.Context) {
+	llmURL := os.Getenv("LLM_URL")
+	llmToken := os.Getenv("LLM_TOKEN")
+	llmModel := os.Getenv("LLM_MODEL")
+	language := os.Getenv("OCR_LANGUAGE")
+
+	configs := map[string]string{
+		"llm.url":           llmURL,
+		"llm.auth_token":    llmToken,
+		"llm.model":         llmModel,
+		"llm.use_anthropic": "false",
+		"llm.extra_body":    `{"thinking": {"type": "disabled"}}`,
+		"language":          language,
+	}
+	for key, val := range configs {
+		setCmd := exec.CommandContext(ctx, "/usr/local/bin/ocr", "config", "set", key, val)
+		setCmd.Env = append(os.Environ(),
+			"OCR_LLM_URL="+llmURL,
+			"OCR_LLM_TOKEN="+llmToken,
+			"OCR_LLM_MODEL="+llmModel,
+			"HOME="+OCRHomeDir,
+		)
+		if output, err := setCmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: failed to set %s: %v, output: %s", key, err, string(output))
+		}
+	}
+}
+
 func getEnvWithDefault(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
 	}
 	return defaultVal
+}
+
+// ParseJSONFile reads a JSON file and unmarshals it into the given target.
+func ParseJSONFile(path string, target interface{}) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, target)
 }
 
 func getEnvIntWithDefault(key string, defaultVal int) int {

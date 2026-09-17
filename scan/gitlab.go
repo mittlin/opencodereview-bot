@@ -7,7 +7,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -15,6 +17,9 @@ var (
 	gitlabURL   string
 	gitlabToken string
 	scanConfig  *Config
+
+	immediateScanMu      sync.Mutex
+	immediateScanRunning bool
 )
 
 func InitGitLabClient(url, token string, cfg *Config) {
@@ -188,7 +193,7 @@ func CreateIssue(ctx context.Context, projectID int, title, body string, labels 
 }
 
 func CreateOrUpdateScanIssue(ctx context.Context, projectID int, title, body string, labels []string, triggerIssueIID int) (int, error) {
-	ocrLabels := append([]string{scanConfig.IssueLabel, "nightly-scan"}, labels...)
+	ocrLabels := append(scanConfig.TriggerLabels, labels...)
 
 	existing, err := FindExistingOCRIssue(ctx, projectID, ocrLabels)
 	if err != nil {
@@ -206,4 +211,112 @@ func CreateOrUpdateScanIssue(ctx context.Context, projectID int, title, body str
 	}
 
 	return CreateIssue(ctx, projectID, title, body, ocrLabels)
+}
+
+func TriggerRescanOnComment(ctx context.Context, projectID int, pathWithNamespace string, issueIID int) error {
+	log.Printf("Queuing rescan for %s (trigger issue #%d)", pathWithNamespace, issueIID)
+
+	queue, err := LoadQueue()
+	if err != nil {
+		return fmt.Errorf("load queue: %w", err)
+	}
+
+	if isProjectInQueue(queue, projectID) {
+		log.Printf("Project %s already in queue, skipping", pathWithNamespace)
+		return nil
+	}
+
+	entry := PriorityEntry{
+		ProjectID:         projectID,
+		PathWithNamespace: pathWithNamespace,
+		TriggerTime:       time.Now(),
+		TriggerIssueIID:   issueIID,
+		TriggerType:       "rescan_comment",
+		BasePriority:      100,
+	}
+
+	queue.NightlyQueue = append(queue.NightlyQueue, entry)
+	if err := SaveQueue(queue); err != nil {
+		return fmt.Errorf("save queue: %w", err)
+	}
+
+	log.Printf("Queued project for rescan: %s (position %d)", pathWithNamespace, len(queue.NightlyQueue))
+	return nil
+}
+
+func TriggerImmediateScan(ctx context.Context, projectID int, pathWithNamespace string, issueIID int) error {
+	log.Printf("Triggering immediate review for %s (trigger issue #%d)", pathWithNamespace, issueIID)
+
+	immediateScanMu.Lock()
+	if immediateScanRunning {
+		immediateScanMu.Unlock()
+		log.Printf("Another immediate scan is running, queueing %s for later", pathWithNamespace)
+		queue, err := LoadQueue()
+		if err != nil {
+			return fmt.Errorf("load queue: %w", err)
+		}
+		if isProjectInQueue(queue, projectID) {
+			return nil
+		}
+		entry := PriorityEntry{
+			ProjectID:         projectID,
+			PathWithNamespace: pathWithNamespace,
+			TriggerTime:       time.Now(),
+			TriggerIssueIID:   issueIID,
+			TriggerType:       "immediate_review",
+			BasePriority:      200,
+		}
+		queue.NightlyQueue = append(queue.NightlyQueue, entry)
+		return SaveQueue(queue)
+	}
+	immediateScanRunning = true
+	immediateScanMu.Unlock()
+
+	go func() {
+		defer func() {
+			immediateScanMu.Lock()
+			immediateScanRunning = false
+			immediateScanMu.Unlock()
+			log.Printf("Immediate review completed for %s", pathWithNamespace)
+		}()
+
+		cfg := LoadConfig()
+		botToken := os.Getenv("BOT_TOKEN")
+		gitlabURLVal := gitlabURL
+		gitlabTokenVal := gitlabToken
+		llmURLVal := os.Getenv("LLM_URL")
+		llmTokenVal := os.Getenv("LLM_TOKEN")
+		llmModelVal := os.Getenv("LLM_MODEL")
+		languageVal := os.Getenv("OCR_LANGUAGE")
+		if languageVal == "" {
+			languageVal = "Chinese"
+		}
+		maxTokensBudgetVal := os.Getenv("OCR_MAX_TOKENS_BUDGET")
+		effortVal := os.Getenv("OCR_EFFORT")
+		providerVal := os.Getenv("OCR_PROVIDER")
+
+		scanCtx := context.Background()
+		entry := PriorityEntry{
+			ProjectID:         projectID,
+			PathWithNamespace: pathWithNamespace,
+			TriggerTime:       time.Now(),
+			TriggerIssueIID:   issueIID,
+			TriggerType:       "immediate_review",
+			BasePriority:      200,
+		}
+
+		result, err := runImmediateScan(scanCtx, entry, cfg, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
+		if err != nil {
+			log.Printf("Immediate review failed for %s: %v", pathWithNamespace, err)
+			return
+		}
+
+		if result != nil && len(result.Comments) > 0 {
+			log.Printf("Immediate review found %d issues in %s", len(result.Comments), pathWithNamespace)
+		} else if result != nil {
+			log.Printf("Immediate review completed for %s (no issues found or scan failed)", pathWithNamespace)
+		}
+	}()
+
+	return nil
 }

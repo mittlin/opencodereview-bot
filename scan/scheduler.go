@@ -121,6 +121,21 @@ func runNightlyScan(botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenV
 		}
 
 		entry := queue.NightlyQueue[i]
+
+		alreadyCompleted := false
+		for _, c := range queue.CompletedThisNight {
+			if c.ProjectID == entry.ProjectID {
+				alreadyCompleted = true
+				break
+			}
+		}
+		if alreadyCompleted {
+			log.Printf("Skipping %s: already completed this night", entry.PathWithNamespace)
+			queue.NightlyQueue = append(queue.NightlyQueue[:i], queue.NightlyQueue[i+1:]...)
+			i--
+			continue
+		}
+
 		log.Printf("Processing project: %s (trigger: %s)", entry.PathWithNamespace, entry.TriggerType)
 
 		progress, err := runProjectScan(ctx, entry, cfg, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
@@ -208,6 +223,7 @@ func runProjectScan(ctx context.Context, entry PriorityEntry, cfg *Config, botTo
 
 	var allComments []ReviewComment
 	var allSummaries []string
+	var scanSuccessful bool
 	windowEnd := parseWindowEnd(cfg.WindowEnd)
 	hardDeadline := time.Now().AddDate(0, 0, 1).Truncate(24*time.Hour).Add(windowEnd).Add(-time.Duration(cfg.HardDeadlineBuffer) * time.Minute)
 
@@ -249,6 +265,7 @@ func runProjectScan(ctx context.Context, entry PriorityEntry, cfg *Config, botTo
 			allSummaries = append(allSummaries, summary)
 		}
 		completedChunks = append(completedChunks, idx)
+		scanSuccessful = true
 
 		queue.InProgress = &ScanProgress{
 			ProjectID:         entry.ProjectID,
@@ -284,9 +301,17 @@ func runProjectScan(ctx context.Context, entry PriorityEntry, cfg *Config, botTo
 				AddCommentToIssue(ctx, entry.ProjectID, entry.TriggerIssueIID, linkMsg)
 			}
 		}
-	} else if len(allComments) == 0 && entry.TriggerIssueIID > 0 {
+	} else if len(allComments) == 0 && entry.TriggerIssueIID > 0 && scanSuccessful {
 		msg := "✅ Nightly scan completed - no issues found"
-		AddCommentToIssue(ctx, entry.ProjectID, entry.TriggerIssueIID, msg)
+		if err := AddCommentToIssue(ctx, entry.ProjectID, entry.TriggerIssueIID, msg); err != nil {
+			log.Printf("Failed to add clean scan comment: %v", err)
+		}
+		if cfg.AutoCloseOnCleanRescan {
+			log.Printf("Auto-closing issue #%d (clean re-scan, auto-close enabled)", entry.TriggerIssueIID)
+			if err := CloseIssue(ctx, entry.ProjectID, entry.TriggerIssueIID); err != nil {
+				log.Printf("Failed to auto-close issue: %v", err)
+			}
+		}
 	}
 
 	return &scanProgressResult{
@@ -396,8 +421,9 @@ func enumerateAndChunkFiles(ctx context.Context, repoDir string, excludes []stri
 }
 
 func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, files []string, cfg *Config, llmURL, llmToken, llmModel, language, maxTokensBudget, effort, provider string) ([]ReviewComment, string, error) {
-	// For chunked scanning, we use --include to specify files
-	// Also pass the global excludes from config
+	// Configure LLM settings (same as bot.go:runReviewWithRepoDir)
+	ConfigLLM(ctx)
+
 	includeArg := strings.Join(files, ",")
 	outputFile := filepath.Join("/data/ocr-reviews", fmt.Sprintf("scan-%s-%d-%d.json",
 		strings.ReplaceAll(entry.PathWithNamespace, "/", "-"), entry.ProjectID, time.Now().Unix()))
@@ -405,12 +431,12 @@ func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, file
 	args := []string{
 		"scan",
 		"--repo", repoDir,
-		"--include", includeArg,
+		"--path", includeArg,
 		"--format", "json",
 		"--output", outputFile,
 		"--model", llmModel,
 		"--timeout", fmt.Sprintf("%d", cfg.ChunkTimeout),
-		"--no-plan", // Skip per-file PLAN_TASK pre-pass for faster scanning
+		"--no-plan",
 	}
 
 	// Add global excludes from config
@@ -434,7 +460,7 @@ func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, file
 		"OCR_LLM_TOKEN="+llmToken,
 		"OCR_LLM_MODEL="+llmModel,
 		"OCR_LANGUAGE="+language,
-		"HOME=/data/ocr-home",
+		"HOME="+OCRHomeDir,
 	)
 
 	var stderr strings.Builder
@@ -463,7 +489,6 @@ func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, file
 		summary = m.(string)
 	}
 
-	os.Remove(outputFile)
 	return comments, summary, nil
 }
 
@@ -506,4 +531,84 @@ func getInt(m map[string]interface{}, key string) int {
 		return v
 	}
 	return 0
+}
+
+func runImmediateScan(ctx context.Context, entry PriorityEntry, cfg *Config, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal string) (*scanProgressResult, error) {
+	log.Printf("Starting immediate review for %s", entry.PathWithNamespace)
+
+	repoDir, err := cloneRepo(ctx, entry.ProjectID, entry.PathWithNamespace, gitlabURLVal, gitlabTokenVal)
+	if err != nil {
+		return nil, fmt.Errorf("clone repo: %w", err)
+	}
+	defer os.RemoveAll(repoDir)
+
+	chunks, err := enumerateAndChunkFiles(ctx, repoDir, strings.Split(cfg.Excludes, ","), cfg.ChunkSize)
+	if err != nil {
+		return nil, fmt.Errorf("enumerate files: %w", err)
+	}
+	totalFiles := 0
+	for _, c := range chunks {
+		totalFiles += c.FileCount
+	}
+	log.Printf("Immediate review %s: %d files in %d chunks", entry.PathWithNamespace, totalFiles, len(chunks))
+
+	var allComments []ReviewComment
+	var allSummaries []string
+	var scanSuccessful bool
+
+	for idx, chunk := range chunks {
+		log.Printf("Scanning chunk %d/%d (%d files)", idx+1, len(chunks), chunk.FileCount)
+		comments, summary, err := runScanChunk(ctx, entry, repoDir, chunk.Files, cfg, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
+		if err != nil {
+			log.Printf("Chunk %d failed: %v", idx, err)
+			continue
+		}
+		scanSuccessful = true
+
+		allComments = append(allComments, comments...)
+		if summary != "" {
+			allSummaries = append(allSummaries, summary)
+		}
+	}
+
+	aggregatedSummary := strings.Join(allSummaries, "\n\n")
+	title := fmt.Sprintf("%sImmediate Review Report - %s", cfg.IssueTitlePrefix, entry.PathWithNamespace)
+	body := buildIssueBody(allComments, aggregatedSummary, entry.PathWithNamespace, "main", entry.TriggerIssueIID)
+
+	issueIID := 0
+	if cfg.CreateIssues && len(allComments) > 0 {
+		issueIID, err = CreateOrUpdateScanIssue(ctx, entry.ProjectID, title, body, []string{}, entry.TriggerIssueIID)
+		if err != nil {
+			log.Printf("Failed to create issue: %v", err)
+		} else {
+			log.Printf("Created immediate review issue #%d for %s", issueIID, entry.PathWithNamespace)
+		}
+	}
+
+	if entry.TriggerIssueIID > 0 {
+		var msg string
+		if !scanSuccessful {
+			msg = fmt.Sprintf("⚠️ Immediate review failed for %s — check LLM configuration and logs", entry.PathWithNamespace)
+		} else if len(allComments) > 0 {
+			msg = fmt.Sprintf("🔍 Immediate review completed - found %d issues. See issue #%d", len(allComments), issueIID)
+		} else {
+			msg = "✅ Immediate review completed - no issues found"
+			if cfg.AutoCloseOnCleanRescan {
+				if err := CloseIssue(ctx, entry.ProjectID, entry.TriggerIssueIID); err != nil {
+					log.Printf("Failed to auto-close issue: %v", err)
+				} else {
+					log.Printf("Auto-closed issue #%d (clean immediate review)", entry.TriggerIssueIID)
+				}
+			}
+		}
+		if err := AddCommentToIssue(ctx, entry.ProjectID, entry.TriggerIssueIID, msg); err != nil {
+			log.Printf("Failed to add comment to trigger issue: %v", err)
+		}
+	}
+
+	return &scanProgressResult{
+		Comments: allComments,
+		Summary:  aggregatedSummary,
+		IssueIID: issueIID,
+	}, nil
 }

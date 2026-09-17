@@ -342,6 +342,17 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 			event.ObjectAttributes.IID,
 			event.ObjectAttributes.Labels)
 		scan.IssueHandler(w, r, event)
+	case "note":
+		var event scan.NoteEvent
+		if err := json.Unmarshal(body, &event); err != nil {
+			http.Error(w, "Invalid note event", http.StatusBadRequest)
+			return
+		}
+		log.Printf("Webhook received: object_kind=note project=%s noteable_type=%s noteable_id=%d",
+			event.Project.PathWithNamespace,
+			event.ObjectAttributes.NoteableType,
+			event.ObjectAttributes.NoteableID)
+		scan.NoteHandler(w, r, event)
 	default:
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": "unsupported event: " + peek.ObjectKind})
@@ -543,7 +554,7 @@ func runReviewWithRepoDir(ctx context.Context, req ReviewRequest, repoDir string
 		}
 	}
 
-	configLLM(ctx)
+	scan.ConfigLLM(ctx)
 
 	// Generate review ID with project path and commit SHA for readability
 	projectPath := req.ProjectPath
@@ -703,29 +714,6 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 	postFunc(projectID, toSHA, result.Comments, repoDir)
 	log.Printf("Review completed: project=%s from=%s to=%s comments=%d",
 		displayProject, fromSHA, toSHA, len(result.Comments))
-}
-
-func configLLM(ctx context.Context) {
-	configs := map[string]string{
-		"llm.url":          llmURL,
-		"llm.auth_token":   llmToken,
-		"llm.model":        llmModel,
-		"llm.use_anthropic": "false",
-		"llm.extra_body":   `{"thinking": {"type": "disabled"}}`,
-		"language":         language,
-	}
-	for key, val := range configs {
-		setCmd := exec.CommandContext(ctx, "/usr/local/bin/ocr", "config", "set", key, val)
-		setCmd.Env = append(os.Environ(),
-			"OCR_LLM_URL="+llmURL,
-			"OCR_LLM_TOKEN="+llmToken,
-			"OCR_LLM_MODEL="+llmModel,
-			"HOME="+homeDir,
-		)
-		if output, err := setCmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to set %s: %v, output: %s", key, err, string(output))
-		}
-	}
 }
 
 // ── Git operations ──────────────────────────────────────────────────────────

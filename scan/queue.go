@@ -83,13 +83,11 @@ type ReviewComment struct {
 }
 
 type GitLabIssue struct {
-	IID    int    `json:"iid"`
-	Title  string `json:"title"`
-	State  string `json:"state"`
-	Labels []struct {
-		Title string `json:"title"`
-	} `json:"labels"`
-	WebURL string `json:"web_url"`
+	IID    int      `json:"iid"`
+	Title  string   `json:"title"`
+	State  string   `json:"state"`
+	Labels []string `json:"labels"`
+	WebURL string   `json:"web_url"`
 }
 
 type GitLabProject struct {
