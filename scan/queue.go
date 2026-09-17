@@ -9,8 +9,14 @@ import (
 
 var queueFilePath = "/data/ocr-reviews/ocr-queue.json"
 
+var metadataFilePath = "/data/ocr-reviews/ocr-metadata.json"
+
 func SetQueueFilePath(path string) {
 	queueFilePath = path
+}
+
+func SetMetadataFilePath(path string) {
+	metadataFilePath = path
 }
 
 type ProjectInfo struct {
@@ -126,6 +132,49 @@ func SaveQueue(queue *NightlyQueue) error {
 	}
 	if err := os.Rename(tmpPath, queueFilePath); err != nil {
 		return fmt.Errorf("rename queue file: %w", err)
+	}
+	return nil
+}
+
+type ScanMetadata struct {
+	LastRunStart       time.Time `json:"last_run_start"`
+	LastRunEnd         time.Time `json:"last_run_end"`
+	LastRunDurationSec float64   `json:"last_run_duration_sec"`
+	LastRunSuccess     bool      `json:"last_run_success"`
+	ProjectsScanned    int       `json:"projects_scanned"`
+	ProjectsSucceeded  int       `json:"projects_succeeded"`
+	ProjectsFailed     int       `json:"projects_failed"`
+	TotalFindings      int       `json:"total_findings"`
+	NextScheduledRun   time.Time `json:"next_run"`
+}
+
+func LoadMetadata() (*ScanMetadata, error) {
+	data, err := os.ReadFile(metadataFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &ScanMetadata{}, nil
+		}
+		return nil, fmt.Errorf("read metadata file: %w", err)
+	}
+
+	var meta ScanMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, fmt.Errorf("unmarshal metadata: %w", err)
+	}
+	return &meta, nil
+}
+
+func SaveMetadata(meta *ScanMetadata) error {
+	tmpPath := metadataFilePath + ".tmp"
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal metadata: %w", err)
+	}
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("write temp metadata file: %w", err)
+	}
+	if err := os.Rename(tmpPath, metadataFilePath); err != nil {
+		return fmt.Errorf("rename metadata file: %w", err)
 	}
 	return nil
 }

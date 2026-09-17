@@ -162,9 +162,9 @@ func CreateIssue(ctx context.Context, projectID int, title, body string, labels 
 	url := fmt.Sprintf("%s/api/v4/projects/%d/issues", gitlabURL, projectID)
 
 	bodyMap := map[string]interface{}{
-		"title":  title,
-		"body":   body,
-		"labels": labels,
+		"title":       title,
+		"description": body,
+		"labels":      labels,
 	}
 	jsonBody, _ := json.Marshal(bodyMap)
 
@@ -193,7 +193,7 @@ func CreateIssue(ctx context.Context, projectID int, title, body string, labels 
 }
 
 func CreateOrUpdateScanIssue(ctx context.Context, projectID int, title, body string, labels []string, triggerIssueIID int) (int, error) {
-	ocrLabels := append(scanConfig.TriggerLabels, labels...)
+	ocrLabels := append([]string{"ocr-result", "nightly-scan"}, labels...)
 
 	existing, err := FindExistingOCRIssue(ctx, projectID, ocrLabels)
 	if err != nil {

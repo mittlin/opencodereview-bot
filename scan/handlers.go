@@ -140,6 +140,12 @@ func ScanStatusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	meta, err := LoadMetadata()
+	if err != nil {
+		log.Printf("Failed to load metadata: %v", err)
+		meta = &ScanMetadata{}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"queued_projects":      len(queue.NightlyQueue),
@@ -148,6 +154,15 @@ func ScanStatusHandler(w http.ResponseWriter, r *http.Request) {
 		"queue":                queue.NightlyQueue,
 		"in_progress_details":  queue.InProgress,
 		"completed":            queue.CompletedThisNight,
+		"last_run_start":       meta.LastRunStart,
+		"last_run_end":         meta.LastRunEnd,
+		"last_run_duration_s":  meta.LastRunDurationSec,
+		"last_run_success":     meta.LastRunSuccess,
+		"projects_scanned":     meta.ProjectsScanned,
+		"projects_succeeded":   meta.ProjectsSucceeded,
+		"projects_failed":      meta.ProjectsFailed,
+		"total_findings":       meta.TotalFindings,
+		"next_run":             meta.NextScheduledRun,
 	})
 }
 
@@ -180,10 +195,13 @@ func NoteHandler(w http.ResponseWriter, r *http.Request, event NoteEvent) {
 		return r
 	}, noteLower)
 
-	if !strings.Contains(noteClean, "@ocr-bot") {
-		log.Printf("Skipping note event: no @ocr-bot mention")
+	log.Printf("Note text: raw=%q clean=%q", event.ObjectAttributes.Note, noteClean)
+
+	triggerPhrase := strings.ToLower(scanConfig.RescanTriggerPhrase)
+	if !strings.Contains(noteClean, triggerPhrase) {
+		log.Printf("Skipping note event: trigger phrase %q not found (clean=%q)", triggerPhrase, noteClean)
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": "no @ocr-bot mention"})
+		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": "trigger phrase not found"})
 		return
 	}
 
