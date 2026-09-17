@@ -5,17 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"testing"
 )
 
 // TestReplayScanResult reads a local scan JSON file, converts comments,
-// builds issue body, and optionally creates the issue on GitLab.
+// and optionally creates per-file issues on GitLab.
 //
 // Usage:
 //   # dry-run (just print body)
 //   go test -run TestReplayScanResult -v ./scan/ -count=1
 //
-//   # create issue on GitLab
+//   # create per-file issues on GitLab
 //   GITLAB_URL=http://10.2.2.80 GITLAB_GROUP_TOKEN=xxx \
 //   GITLAB_PROJECT_ID=318 go test -run TestReplayScanResult -v ./scan/ -count=1
 
@@ -67,32 +68,80 @@ func TestReplayScanResult(t *testing.T) {
 	}
 	t.Logf("Summary: %s", truncate(summary, 200))
 
-	// 4. Build issue body
+	// 4. Group by file
 	gitlabURL := os.Getenv("GITLAB_URL")
 	if gitlabURL == "" {
 		gitlabURL = "http://10.2.2.80"
 	}
 	projectPath := "tda4vmeco/common"
-	body := buildIssueBody(comments, summary, projectPath, "main", gitlabURL, 0)
-	t.Logf("Issue body length: %d chars", len(body))
-	t.Logf("Issue body preview:\n%s", truncate(body, 2000))
 
-	// 5. Optionally create issue on GitLab
+	byFile := map[string][]ReviewComment{}
+	for _, c := range comments {
+		byFile[c.File] = append(byFile[c.File], c)
+	}
+
+	files := make([]string, 0, len(byFile))
+	for f := range byFile {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+
+	t.Logf("\n=== Per-file issues (%d files) ===", len(files))
+	for _, file := range files {
+		cs := byFile[file]
+		body := FormatFileIssueBody(cs, file, projectPath, "main", gitlabURL)
+		baseName := GetFileBaseName(file)
+		t.Logf("  %s: %d findings, body length: %d chars", baseName, len(cs), len(body))
+	}
+
+	// 5. Optionally create per-file issues on GitLab
 	projectID := os.Getenv("GITLAB_PROJECT_ID")
 	gitlabTokenVal := os.Getenv("GITLAB_GROUP_TOKEN")
 	if projectID == "" || gitlabTokenVal == "" {
-		t.Log("\n--- DRY RUN: Set GITLAB_PROJECT_ID and GITLAB_GROUP_TOKEN to create issue ---")
+		t.Log("\n--- DRY RUN: Set GITLAB_PROJECT_ID and GITLAB_GROUP_TOKEN to create issues ---")
 		return
 	}
 
 	InitGitLabClient(gitlabURL, gitlabTokenVal, LoadConfig())
+	pid := atoi(projectID)
 
-	title := fmt.Sprintf("%sNightly Scan Report - %s", cfg().IssueTitlePrefix, projectPath)
-	issueIID, err := CreateOrUpdateScanIssue(context.Background(), atoi(projectID), title, body, []string{}, 0)
+	// Create trigger issue
+	triggerTitle := "[OCR] Trigger - replay test"
+	triggerBody := "Test trigger issue for replay verification. Summary comment should appear here."
+	triggerIID, err := CreateIssue(context.Background(), pid, triggerTitle, triggerBody, []string{"ocr-trigger"})
 	if err != nil {
-		t.Fatalf("Failed to create issue: %v", err)
+		t.Fatalf("Failed to create trigger issue: %v", err)
 	}
-	t.Logf("Created GitLab issue #%d", issueIID)
+	t.Logf("Created trigger issue #%d", triggerIID)
+
+	// Create per-file issues (with triggerIssueIID)
+	fileIssues := map[string]int{}
+	for _, file := range files {
+		cs := byFile[file]
+		body := FormatFileIssueBody(cs, file, projectPath, "main", gitlabURL)
+		fiid, err := CreateOrUpdateFileIssue(context.Background(), pid, file, body, triggerIID)
+		if err != nil {
+			t.Logf("Failed to create issue for %s: %v", file, err)
+			continue
+		}
+		fileIssues[file] = fiid
+		t.Logf("Created file issue #%d for %s (%d findings)", fiid, GetFileBaseName(file), len(cs))
+	}
+
+	// Post summary comment on trigger issue
+	summaryComment := buildSummaryComment(byFile, fileIssues, gitlabURL, projectPath, "main")
+	if err := AddCommentToIssue(context.Background(), pid, triggerIID, summaryComment); err != nil {
+		t.Fatalf("Failed to post summary comment: %v", err)
+	}
+	t.Logf("Posted summary comment on trigger issue #%d", triggerIID)
+
+	// Print summary
+	t.Logf("\n=== Summary ===")
+	for _, file := range files {
+		baseName := GetFileBaseName(file)
+		fiid := fileIssues[file]
+		t.Logf("  %s: %d findings -> #%d", baseName, len(byFile[file]), fiid)
+	}
 }
 
 func truncate(s string, max int) string {
@@ -110,8 +159,4 @@ func atoi(s string) int {
 		}
 	}
 	return n
-}
-
-func cfg() *Config {
-	return LoadConfig()
 }
