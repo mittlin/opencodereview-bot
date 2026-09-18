@@ -577,9 +577,6 @@ func runReviewWithRepoDir(ctx context.Context, req ReviewRequest, repoDir string
 		args = append(args, "--from", "origin/"+req.TargetBranch, "--to", req.CommitSHA)
 	}
 
-	if len(req.IncludePaths) > 0 {
-		args = append(args, "--path", strings.Join(req.IncludePaths, ","))
-	}
 	if len(req.ExcludePaths) > 0 {
 		args = append(args, "--exclude", strings.Join(req.ExcludePaths, ","))
 	}

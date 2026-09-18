@@ -2,15 +2,19 @@
 
 ## 概述
 
-OpenCodeReview Bot 是一个 AI 代码审查服务，通过 GitLab Webhook 自动触发代码审查，支持三种事件：
+OpenCodeReview Bot 是一个 AI 代码审查服务，通过 GitLab Webhook 自动触发代码审查，支持五种事件：
 
 - **Push events** — 代码推送到分支时触发
 - **Merge Request events** — MR 创建/更新时触发
 - **Release events** — Release 发布时触发，对比两个 release 之间的差异
+- **Issue events** — Issue 创建（带触发标签）时加入定时扫描队列
+- **Note events** — 在 Issue 上评论 `@ocr-bot review` 触发即时扫描
 
 审查结果以评论形式写入 GitLab：
 - Push/Release → commit discussions（commit 页面）
 - MR → MR discussions（MR 页面）
+
+此外，支持**定时全量扫描**（Nightly Scan），每天自动扫描 GitLab Group 下所有项目，按文件创建独立 Issue。
 
 ---
 
@@ -43,6 +47,8 @@ OpenCodeReview Bot 是一个 AI 代码审查服务，通过 GitLab Webhook 自�
      - ☑ **Push events**
      - ☑ **Merge request events**
      - ☑ **Release events**
+     - ☑ **Issue events**（用于定时扫描触发）
+     - ☑ **Comments**（用于 `@ocr-bot review` 即时扫描）
    - ☑ **Enable SSL verification**（如果使用 HTTPS）
 4. 点击 **Add webhook**
 
@@ -90,6 +96,7 @@ docker run -d --name ocr-bot \
   -e WEBHOOK_SECRET=your-webhook-secret \
   -e GITLAB_GROUP_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx \
   -e GITLAB_URL=http://your-gitlab-server \
+  -e OCR_GROUP_ID=123 \
   -e OCR_LANGUAGE=Chinese \
   -e LLM_URL=http://your-llm-server/v1/chat/completions \
   -e LLM_TOKEN=your-llm-api-key \
@@ -100,21 +107,44 @@ docker run -d --name ocr-bot \
 
 ### 2.3 环境变量说明
 
+#### 基础配置（必填）
+
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `BOT_TOKEN` | ✅ | — | API 认证 token（手动调用 /review 接口时使用） |
 | `WEBHOOK_SECRET` | ✅ | — | GitLab Webhook Secret Token（验证请求来源） |
 | `GITLAB_GROUP_TOKEN` | ✅ | — | Group Access Token（clone 仓库 + 调用 GitLab API） |
 | `GITLAB_URL` | ✅ | — | GitLab 服务器地址 |
-| `OCR_LANGUAGE` | 否 | `Chinese` | 审查输出语言 |
 | `LLM_URL` | ✅ | — | LLM API 地址 |
 | `LLM_TOKEN` | ✅ | — | LLM API key |
 | `LLM_MODEL` | ✅ | — | LLM 模型名称 |
+
+#### 可选配置
+
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `OCR_LANGUAGE` | 否 | `Chinese` | 审查输出语言 |
 | `OCR_LLM_TIMEOUT` | 否 | `900` | LLM 请求超时（秒） |
-| `OCR_MAX_TOKENS_BUDGET` | 否 | — | 总 token 预算限制（对应 `--max-tokens-budget`） |
-| `OCR_EFFORT` | 否 | — | 审查 effort 预设：low/medium/high（对应 `--effort`） |
-| `OCR_PROVIDER` | 否 | — | LLM provider 覆盖（对应 `--provider`） |
+| `OCR_MAX_TOKENS_BUDGET` | 否 | — | 总 token 预算限制 |
+| `OCR_EFFORT` | 否 | — | 审查 effort 预设：low/medium/high |
+| `OCR_PROVIDER` | 否 | — | LLM provider 覆盖 |
 | `PORT` | 否 | `9999` | Bot 监听端口 |
+
+#### 定时扫描配置（Nightly Scan）
+
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `OCR_GROUP_ID` | ✅（启用扫描时） | — | GitLab Group ID |
+| `OCR_SCAN_ENABLED` | 否 | `true` | 启用/禁用定时扫描 |
+| `OCR_SCHEDULE_CRON` | 否 | `0 21 * * *` | Cron 表达式（6字段，含秒） |
+| `OCR_SCAN_WINDOW_END` | 否 | `08:00` | 扫描截止时间（次日） |
+| `OCR_SCAN_EXCLUDES` | 否 | `**/generated/*,**/testdata/*,**/vendor/*` | 排除文件模式 |
+| `OCR_SCAN_CHUNK_SIZE` | 否 | `500` | 大仓库分块大小 |
+| `OCR_CREATE_ISSUES` | 否 | `true` | 是否创建 GitLab Issue |
+| `OCR_ISSUE_LABEL` | 否 | `ocr-review` | Issue 标签 |
+| `OCR_ISSUE_TRIGGER_LABELS` | 否 | `ocr-scan,ocr-trigger` | 触发扫描的 Issue 标签 |
+| `OCR_AUTO_CLOSE_ON_CLEAN_RESCAN` | 否 | `true` | 清洁扫描后自动关闭 Issue |
+| `OCR_RESCAN_TRIGGER_PHRASE` | 否 | `@ocr-bot review` | 评论触发短语 |
 
 ---
 
@@ -169,6 +199,13 @@ curl -X POST http://localhost:9999/review \
   }'
 ```
 
+### 3.5 测试扫描状态
+
+```bash
+curl http://localhost:9999/scan-status
+# 期望输出: JSON 包含 queued_projects, last_run_start, next_run 等字段
+```
+
 ---
 
 ## 4. Webhook 事件处理
@@ -196,39 +233,103 @@ Bot 使用单一端点 `/webhook`，根据 GitLab 发送的 `object_kind` 字段
 - **评论位置**: 新 release tag 对应 commit 的 discussions
 - **实现**: 通过 Release API 获取所有 release，按时间排序找到前一个 tag
 
+### 4.4 Issue events（定时扫描触发）
+
+- **触发条件**: Issue 创建或重新打开，且带有触发标签（`ocr-scan` 或 `ocr-trigger`）
+- **行为**: 将项目加入定时扫描队列
+- **返回**: 队列位置
+
+### 4.5 Note events（即时扫描）
+
+- **触发条件**: 在 Issue 上评论，包含触发短语
+- **`@ocr-bot review`**: 立即扫描该 Issue 所在项目，结果写入 Issue 评论
+- **`@ocr-bot rescan`**: 将项目加入定时扫描队列
+- **并发限制**: 同一时间只能运行 1 个即时扫描
+
 ---
 
-## 5. 常见问题
+## 5. 定时扫描（Nightly Scan）
 
-### 5.1 Bot 无法 clone 私有仓库
+### 5.1 概述
+
+定时扫描功能每天自动扫描指定 GitLab Group 下的所有项目：
+- 默认每天 21:00 启动，次日 08:00 前停止
+- 大仓库自动分块（每块 500 个文件），支持跨天恢复
+- 每个文件的扫描结果创建独立的 GitLab Issue
+- 旧 Issue 自动关闭（Superseded 或 Stale cleanup）
+
+### 5.2 Issue 标签体系
+
+| 标签 | 用途 |
+|------|------|
+| `ocr-result` | 扫描结果 Issue |
+| `nightly-scan` | 标记为定时扫描产生 |
+| `file:<filename>` | 文件级标签（如 `file:main.go`） |
+
+### 5.3 自动关闭流程
+
+1. **清洁扫描**: 0 个发现 → 关闭该项目所有文件 Issue
+2. **过期清理**: 扫描结果中不再包含的文件 → 关闭其旧 Issue
+3. **Issue 重新打开**: 重新打开带触发标签的 Issue → 加入扫描队列
+
+### 5.4 监控
+
+```bash
+# 查看扫描状态
+curl http://localhost:9999/scan-status
+
+# 返回字段：
+# - queued_projects: 队列中项目数
+# - in_progress: 是否正在扫描
+# - completed_this_night: 今晚已完成数
+# - last_run_start/end: 上次运行时间
+# - last_run_duration_s: 上次运行时长（秒）
+# - projects_scanned/succeeded/failed: 统计
+# - total_findings: 总发现数
+# - next_run: 下次运行时间
+```
+
+---
+
+## 6. 常见问题
+
+### 6.1 Bot 无法 clone 私有仓库
 
 检查 `GITLAB_GROUP_TOKEN` 是否正确配置，token 是否有 `read_repository` scope。
 
-### 5.2 Webhook 返回 403 Forbidden
+### 6.2 Webhook 返回 403 Forbidden
 
 检查 GitLab Webhook 配置中的 **Secret token** 是否与容器的 `WEBHOOK_SECRET` 环境变量一致。
 
-### 5.3 LLM 超时
+### 6.3 LLM 超时
 
 Qwen3.6-27B 模型较慢，建议设置 `OCR_LLM_TIMEOUT=900`（15 分钟）。
 
-### 5.4 LLM 认证失败
+### 6.4 LLM 认证失败
 
 检查环境变量使用 `OCR_LLM_TOKEN`（不是 `OCR_LLM_AUTH_TOKEN`）。
 
-### 5.5 查看实时日志
+### 6.5 定时扫描未启动
+
+检查 `OCR_GROUP_ID` 是否已设置，`OCR_SCAN_ENABLED` 是否为 `true`。
+
+### 6.6 扫描结果 Issue 为空
+
+GitLab Issues API 使用 `description` 字段（不是 `body`）。检查 Bot 日志确认 Issue 创建成功。
+
+### 6.7 查看实时日志
 
 ```bash
 docker logs -f --tail 100 ocr-bot
 ```
 
-### 5.6 重启容器
+### 6.8 重启容器
 
 ```bash
 docker restart ocr-bot
 ```
 
-### 5.7 更新镜像
+### 6.9 更新镜像
 
 ```bash
 docker stop ocr-bot && docker rm ocr-bot
@@ -238,7 +339,7 @@ docker run -d --name ocr-bot ...  # 使用之前的启动命令
 
 ---
 
-## 6. 版本信息
+## 7. 版本信息
 
 - **当前版本**: v1.11.7 (基于 alibaba/open-code-review@810aeb5)
 - **模块路径**: `github.com/alibaba/open-code-review`
@@ -246,26 +347,35 @@ docker run -d --name ocr-bot ...  # 使用之前的启动命令
 
 ---
 
-## 7. 架构图
+## 8. 架构图
 
 ```
 GitLab (http://xxxx)
     │
     │  Webhook (Secret Token)
     ▼
-┌─────────────────────────────────────┐
-│  OpenCodeReview Bot (:9999)         │
-│                                     │
-│  /webhook ──┬── push ──→ OCR ──→ commit discussions
-│             ├── mr ────→ OCR ──→ MR discussions
-│             └── release→ OCR ──→ commit discussions
-│                                     │
-│  /review (手动 API)                  │
-│  /health (健康检查)                  │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  OpenCodeReview Bot (:9999)                      │
+│                                                  │
+│  /webhook ──┬── push ──────→ OCR ──→ commit discussions
+│             ├── mr ─────────→ OCR ──→ MR discussions
+│             ├── release ────→ OCR ──→ commit discussions
+│             ├── issue ──────→ 加入扫描队列
+│             └── note ───────→ @ocr-bot review → 即时扫描
+│             └── note ───────→ @ocr-bot rescan → 加入扫描队列
+│                                                  │
+│  /review (手动 API)                               │
+│  /scan-status (扫描状态)                           │
+│  /health (健康检查)                                │
+│                                                  │
+│  ┌─ Nightly Scheduler (cron 0 21 * * *) ─────┐  │
+│  │  遍历队列 → Clone → 分块 → OCR scan       │  │
+│  │  → 按文件创建 Issue → 关闭旧 Issue          │  │
+│  │  → 发布汇总评论到触发 Issue                  │  │
+│  └───────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────┘
     │
     │  Group Access Token (clone + API)
     ▼
-GitLab Repository (clone) + GitLab API (post comments)
+GitLab Repository (clone) + GitLab API (post comments/create issues)
 ```
-
