@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -175,4 +176,29 @@ func parseGitmodulesHosts(repoDir string) []submoduleHost {
 		}
 	}
 	return hosts
+}
+
+// buildGitURL builds an authenticated Git URL for git ls-remote.
+// Format: scheme://oauth2:TOKEN@host/group/repo.git
+func buildGitURL(gitlabURL, gitlabToken, projectPath string) string {
+	u, _ := url.Parse(gitlabURL)
+	return fmt.Sprintf("%s://oauth2:%s@%s/%s.git", u.Scheme, gitlabToken, u.Host, projectPath)
+}
+
+// ValidateBranch checks if a branch exists in the remote repository using git ls-remote.
+// Returns error if branch not found or git command fails.
+func ValidateBranch(ctx context.Context, gitlabURL, gitlabToken, projectPath, branch string) error {
+	if branch == "" {
+		return nil // default branch, no validation needed
+	}
+	url := buildGitURL(gitlabURL, gitlabToken, projectPath)
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--heads", url, branch)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git ls-remote failed: %w, output: %s", err, string(output))
+	}
+	if len(strings.TrimSpace(string(output))) == 0 {
+		return fmt.Errorf("branch %q not found in repository", branch)
+	}
+	return nil
 }

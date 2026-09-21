@@ -156,8 +156,8 @@ func TestConfigDefaults(t *testing.T) {
 	if !cfg.AutoCloseOnCleanRescan {
 		t.Error("Expected AutoCloseOnCleanRescan true by default")
 	}
-	if cfg.RescanTriggerPhrase != "@ocr-bot review" {
-		t.Errorf("Expected RescanTriggerPhrase '@ocr-bot review', got %s", cfg.RescanTriggerPhrase)
+	if cfg.RescanTriggerPhrase != "@ocr-bot" {
+		t.Errorf("Expected RescanTriggerPhrase '@ocr-bot', got %s", cfg.RescanTriggerPhrase)
 	}
 	if len(cfg.TriggerLabels) != 2 {
 		t.Errorf("Expected 2 trigger labels, got %d", len(cfg.TriggerLabels))

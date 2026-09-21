@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 )
+
+var queueMutex sync.Mutex
 
 var queueFilePath = "/data/ocr-reviews/ocr-queue.json"
 
@@ -45,6 +48,7 @@ type ScanProgress struct {
 	TriggerIssueIID    int
 	TriggerType        string
 	DefaultBranch      string
+	SourceBranch       string
 	// RepoDir is NOT persisted - temp dir won't survive restart
 	// Re-clone on resume using ProjectID + PathWithNamespace
 }
@@ -62,6 +66,7 @@ type PriorityEntry struct {
 	TriggerIssueIID     int
 	TriggerType         string
 	BasePriority        float64
+	SourceBranch        string
 }
 
 type CompletedEntry struct {
@@ -98,6 +103,9 @@ type GitLabProject struct {
 }
 
 func LoadQueue() (*NightlyQueue, error) {
+	queueMutex.Lock()
+	defer queueMutex.Unlock()
+
 	data, err := os.ReadFile(queueFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -123,6 +131,9 @@ func LoadQueue() (*NightlyQueue, error) {
 }
 
 func SaveQueue(queue *NightlyQueue) error {
+	queueMutex.Lock()
+	defer queueMutex.Unlock()
+
 	tmpPath := queueFilePath + ".tmp"
 	data, err := json.MarshalIndent(queue, "", "  ")
 	if err != nil {
@@ -178,4 +189,23 @@ func SaveMetadata(meta *ScanMetadata) error {
 		return fmt.Errorf("rename metadata file: %w", err)
 	}
 	return nil
+}
+
+// IsProjectInQueue checks if a project is in the queue (thread-safe).
+// Must be called while holding queueMutex, or use LoadQueue/SaveQueue which handle locking.
+func IsProjectInQueue(queue *NightlyQueue, projectID int) bool {
+	for _, e := range queue.NightlyQueue {
+		if e.ProjectID == projectID {
+			return true
+		}
+	}
+	if queue.InProgress != nil && queue.InProgress.ProjectID == projectID {
+		return true
+	}
+	for _, c := range queue.CompletedThisNight {
+		if c.ProjectID == projectID {
+			return true
+		}
+	}
+	return false
 }

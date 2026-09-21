@@ -18,9 +18,10 @@ import (
 )
 
 var (
-	schedulerMu     sync.Mutex
-	schedulerRunning bool
-	scanCancelFunc  context.CancelFunc
+	schedulerMu       sync.Mutex
+	schedulerRunning   bool
+	scanCancelFunc     context.CancelFunc
+	defaultBranchCache sync.Map // projectID -> defaultBranch
 )
 
 func StartScheduler(ctx context.Context, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal string) error {
@@ -209,6 +210,27 @@ func parseWindowEnd(windowEnd string) time.Duration {
 	return h + m
 }
 
+// getBranchForProject returns the branch to use for a project.
+// Priority: entry.SourceBranch > cached default branch > "main"
+func getBranchForProject(ctx context.Context, entry PriorityEntry, gitlabURLVal, gitlabTokenVal string) string {
+	branch := entry.SourceBranch
+	if branch != "" {
+		return branch
+	}
+	// Try cached default branch
+	if v, ok := defaultBranchCache.Load(entry.ProjectID); ok {
+		return v.(string)
+	}
+	// Fetch from GitLab API
+	fetchedBranch, err := GetProjectDefaultBranch(ctx, entry.ProjectID)
+	if err != nil {
+		log.Printf("Failed to get default branch for project %d: %v, using 'main'", entry.ProjectID, err)
+		return "main"
+	}
+	defaultBranchCache.Store(entry.ProjectID, fetchedBranch)
+	return fetchedBranch
+}
+
 type scanProgressResult struct {
 	Comments  []ReviewComment
 	Summary   string
@@ -229,7 +251,7 @@ func runProjectScan(ctx context.Context, entry PriorityEntry, cfg *Config, botTo
 	if queue.InProgress != nil && queue.InProgress.ProjectID == entry.ProjectID {
 		// Resume: re-clone repo (temp dir doesn't survive restart)
 		log.Printf("Resuming project %s: %d/%d chunks done, re-cloning...", entry.PathWithNamespace, len(queue.InProgress.CompletedChunks), len(queue.InProgress.PendingChunks)+len(queue.InProgress.CompletedChunks))
-		repoDir, err = CloneRepo(ctx, entry.ProjectID, entry.PathWithNamespace, gitlabURLVal, gitlabTokenVal, "", "", "")
+		repoDir, err = CloneRepo(ctx, entry.ProjectID, entry.PathWithNamespace, gitlabURLVal, gitlabTokenVal, entry.SourceBranch, "", "")
 		if err != nil {
 			return nil, fmt.Errorf("clone repo for resume: %w", err)
 		}
@@ -240,7 +262,7 @@ func runProjectScan(ctx context.Context, entry PriorityEntry, cfg *Config, botTo
 		completedChunks = queue.InProgress.CompletedChunks
 	} else {
 		log.Printf("Cloning repository for %s", entry.PathWithNamespace)
-		repoDir, err = CloneRepo(ctx, entry.ProjectID, entry.PathWithNamespace, gitlabURLVal, gitlabTokenVal, "", "", "")
+		repoDir, err = CloneRepo(ctx, entry.ProjectID, entry.PathWithNamespace, gitlabURLVal, gitlabTokenVal, entry.SourceBranch, "", "")
 		if err != nil {
 			return nil, fmt.Errorf("clone repo: %w", err)
 		}
@@ -270,19 +292,20 @@ func runProjectScan(ctx context.Context, entry PriorityEntry, cfg *Config, botTo
 
 		if time.Now().After(hardDeadline) {
 			log.Printf("Hard deadline reached, saving progress at chunk %d/%d", idx, len(chunks))
-			queue.InProgress = &ScanProgress{
-				ProjectID:          entry.ProjectID,
-				PathWithNamespace:  entry.PathWithNamespace,
-				TotalFiles:         totalFiles,
-				CompletedChunks:    completedChunks,
-				PendingChunks:      chunks[idx:],
-				CurrentChunk:       idx,
-				StartedAt:          time.Now(),
-				LastUpdateAt:       time.Now(),
-				TriggerIssueIID:    entry.TriggerIssueIID,
-				TriggerType:        entry.TriggerType,
-				DefaultBranch:      "main",
-			}
+queue.InProgress = &ScanProgress{
+			ProjectID:          entry.ProjectID,
+			PathWithNamespace:  entry.PathWithNamespace,
+			TotalFiles:         totalFiles,
+			CompletedChunks:    completedChunks,
+			PendingChunks:      chunks[idx:],
+			CurrentChunk:       idx,
+			StartedAt:          time.Now(),
+			LastUpdateAt:       time.Now(),
+			TriggerIssueIID:    entry.TriggerIssueIID,
+			TriggerType:        entry.TriggerType,
+			DefaultBranch:      "main",
+			SourceBranch:       entry.SourceBranch,
+		}
 			if err := SaveQueue(queue); err != nil {
 				log.Printf("Failed to save progress: %v", err)
 			}
@@ -315,13 +338,14 @@ func runProjectScan(ctx context.Context, entry PriorityEntry, cfg *Config, botTo
 			TriggerIssueIID:   entry.TriggerIssueIID,
 			TriggerType:       entry.TriggerType,
 			DefaultBranch:     "main",
+			SourceBranch:      entry.SourceBranch,
 		}
 		if err := SaveQueue(queue); err != nil {
 			log.Printf("Failed to save progress: %v", err)
 		}
 	}
 
-	return scanChunksAndReport(ctx, entry, cfg, allComments, allSummaries, scanSuccessful, gitlabURLVal, "Nightly Scan Report")
+	return scanChunksAndReport(ctx, entry, cfg, allComments, allSummaries, scanSuccessful, gitlabURLVal, gitlabTokenVal, "Nightly Scan Report")
 }
 
 func buildIssueBody(comments []ReviewComment, summary, projectPath, defaultBranch, gitlabURL string, triggerIssueIID int) string {
@@ -378,11 +402,14 @@ func buildSummaryComment(byFile map[string][]ReviewComment, fileIssues map[strin
 
 // scanChunksAndReport handles the shared post-scan logic for both nightly and immediate scans:
 // create per-file issues, close stale issues, post summary on trigger issue.
-func scanChunksAndReport(ctx context.Context, entry PriorityEntry, cfg *Config, allComments []ReviewComment, allSummaries []string, scanSuccessful bool, gitlabURLVal, reportTitle string) (*scanProgressResult, error) {
+func scanChunksAndReport(ctx context.Context, entry PriorityEntry, cfg *Config, allComments []ReviewComment, allSummaries []string, scanSuccessful bool, gitlabURLVal, gitlabTokenVal, reportTitle string) (*scanProgressResult, error) {
 	aggregatedSummary := strings.Join(allSummaries, "\n\n")
 
 	issueIID := 0
 	fileIssues := map[string]int{}
+
+	// Get branch for this project (SourceBranch or default branch)
+	branch := getBranchForProject(ctx, entry, gitlabURLVal, gitlabTokenVal)
 
 	if cfg.CreateIssues && len(allComments) > 0 {
 		// Group by file
@@ -393,7 +420,7 @@ func scanChunksAndReport(ctx context.Context, entry PriorityEntry, cfg *Config, 
 
 		keepLabels := map[string]bool{}
 		for filePath, fileComments := range byFile {
-			fileBody := FormatFileIssueBody(fileComments, filePath, entry.PathWithNamespace, "main", gitlabURLVal)
+			fileBody := FormatFileIssueBody(fileComments, filePath, entry.PathWithNamespace, branch, gitlabURLVal)
 			fiid, err := CreateOrUpdateFileIssue(ctx, entry.ProjectID, filePath, fileBody, entry.TriggerIssueIID)
 			if err != nil {
 				log.Printf("Failed to create file issue for %s: %v", filePath, err)
@@ -412,7 +439,7 @@ func scanChunksAndReport(ctx context.Context, entry PriorityEntry, cfg *Config, 
 
 		// Post summary comment on trigger issue
 		if entry.TriggerIssueIID > 0 {
-			summaryComment := buildSummaryComment(byFile, fileIssues, gitlabURLVal, entry.PathWithNamespace, "main")
+			summaryComment := buildSummaryComment(byFile, fileIssues, gitlabURLVal, entry.PathWithNamespace, branch)
 			if err := AddCommentToIssue(ctx, entry.ProjectID, entry.TriggerIssueIID, summaryComment); err != nil {
 				log.Printf("Failed to add summary comment: %v", err)
 			}
@@ -507,9 +534,9 @@ func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, file
 }
 
 func runImmediateScan(ctx context.Context, entry PriorityEntry, cfg *Config, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal string) (*scanProgressResult, error) {
-	log.Printf("Starting immediate review for %s", entry.PathWithNamespace)
+	log.Printf("Starting immediate review for %s (branch=%s)", entry.PathWithNamespace, entry.SourceBranch)
 
-	repoDir, err := CloneRepo(ctx, entry.ProjectID, entry.PathWithNamespace, gitlabURLVal, gitlabTokenVal, "", "", "")
+	repoDir, err := CloneRepo(ctx, entry.ProjectID, entry.PathWithNamespace, gitlabURLVal, gitlabTokenVal, entry.SourceBranch, "", "")
 	if err != nil {
 		return nil, fmt.Errorf("clone repo: %w", err)
 	}
@@ -544,5 +571,5 @@ func runImmediateScan(ctx context.Context, entry PriorityEntry, cfg *Config, bot
 		}
 	}
 
-	return scanChunksAndReport(ctx, entry, cfg, allComments, allSummaries, scanSuccessful, gitlabURLVal, "Immediate Review Report")
+	return scanChunksAndReport(ctx, entry, cfg, allComments, allSummaries, scanSuccessful, gitlabURLVal, gitlabTokenVal, "Immediate Review Report")
 }

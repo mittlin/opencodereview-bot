@@ -80,6 +80,33 @@ func ListGroupProjects(ctx context.Context, groupID string) ([]ProjectInfo, erro
 	return allProjects, nil
 }
 
+// GetProjectDefaultBranch fetches the default branch for a project from GitLab API.
+func GetProjectDefaultBranch(ctx context.Context, projectID int) (string, error) {
+	url := fmt.Sprintf("%s/api/v4/projects/%d", gitlabURL, projectID)
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req.Header.Set("PRIVATE-TOKEN", gitlabToken)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("get project: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("get project: status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var project GitLabProject
+	if err := json.NewDecoder(resp.Body).Decode(&project); err != nil {
+		return "", fmt.Errorf("decode project: %w", err)
+	}
+
+	return project.DefaultBranch, nil
+}
+
 func FindExistingOCRIssue(ctx context.Context, projectID int, labels []string) (*GitLabIssue, error) {
 	labelStr := strings.Join(labels, ",")
 	url := fmt.Sprintf("%s/api/v4/projects/%d/issues?labels=%s&state=opened&per_page=10", gitlabURL, projectID, labelStr)
@@ -305,8 +332,8 @@ func CloseStaleFileIssues(ctx context.Context, projectID int, keepLabels map[str
 	return nil
 }
 
-func TriggerRescanOnComment(ctx context.Context, projectID int, pathWithNamespace string, issueIID int) error {
-	log.Printf("Queuing rescan for %s (trigger issue #%d)", pathWithNamespace, issueIID)
+func TriggerRescanOnComment(ctx context.Context, projectID int, pathWithNamespace string, issueIID int, sourceBranch string) error {
+	log.Printf("Queuing rescan for %s (trigger issue #%d, branch=%s)", pathWithNamespace, issueIID, sourceBranch)
 
 	queue, err := LoadQueue()
 	if err != nil {
@@ -325,6 +352,7 @@ func TriggerRescanOnComment(ctx context.Context, projectID int, pathWithNamespac
 		TriggerIssueIID:   issueIID,
 		TriggerType:       "rescan_comment",
 		BasePriority:      100,
+		SourceBranch:      sourceBranch,
 	}
 
 	queue.NightlyQueue = append(queue.NightlyQueue, entry)
@@ -336,8 +364,8 @@ func TriggerRescanOnComment(ctx context.Context, projectID int, pathWithNamespac
 	return nil
 }
 
-func TriggerImmediateScan(ctx context.Context, projectID int, pathWithNamespace string, issueIID int) error {
-	log.Printf("Triggering immediate review for %s (trigger issue #%d)", pathWithNamespace, issueIID)
+func TriggerImmediateScan(ctx context.Context, projectID int, pathWithNamespace string, issueIID int, sourceBranch string) error {
+	log.Printf("Triggering immediate review for %s (trigger issue #%d, branch=%s)", pathWithNamespace, issueIID, sourceBranch)
 
 	immediateScanMu.Lock()
 	if immediateScanRunning {
@@ -357,6 +385,7 @@ func TriggerImmediateScan(ctx context.Context, projectID int, pathWithNamespace 
 			TriggerIssueIID:   issueIID,
 			TriggerType:       "immediate_review",
 			BasePriority:      200,
+			SourceBranch:      sourceBranch,
 		}
 		queue.NightlyQueue = append(queue.NightlyQueue, entry)
 		return SaveQueue(queue)
@@ -395,6 +424,7 @@ func TriggerImmediateScan(ctx context.Context, projectID int, pathWithNamespace 
 			TriggerIssueIID:   issueIID,
 			TriggerType:       "immediate_review",
 			BasePriority:      200,
+			SourceBranch:      sourceBranch,
 		}
 
 		result, err := runImmediateScan(scanCtx, entry, cfg, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)

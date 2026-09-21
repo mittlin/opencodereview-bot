@@ -2,6 +2,7 @@ package scan
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -59,25 +60,40 @@ func IssueHandler(w http.ResponseWriter, r *http.Request, event IssueEvent) {
 		return
 	}
 
-	hasTriggerLabel := false
-	for _, label := range event.ObjectAttributes.Labels {
-		for _, tl := range scanConfig.TriggerLabels {
-			if strings.EqualFold(label.Title, tl) {
-				hasTriggerLabel = true
-				break
-			}
-		}
-		if hasTriggerLabel {
-			break
+	// Parse labels: find trigger label and branch candidates
+	triggerLabel, candidates, err := parseLabels(event.ObjectAttributes.Labels, scanConfig.TriggerLabels)
+	if err != nil {
+		log.Printf("Skipping issue event: %v", err)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": err.Error()})
+		return
+	}
+
+	// Validate each candidate branch via git ls-remote
+	var validBranches []string
+	for _, candidate := range candidates {
+		if err := ValidateBranch(r.Context(), gitlabURL, gitlabToken, event.Project.PathWithNamespace, candidate); err == nil {
+			validBranches = append(validBranches, candidate)
 		}
 	}
 
-	if !hasTriggerLabel {
-		log.Printf("Skipping issue event: no trigger label (labels=%v)", event.ObjectAttributes.Labels)
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": "no trigger label"})
+	// Resolve branch
+	var sourceBranch string
+	switch len(validBranches) {
+	case 0:
+		sourceBranch = "" // default branch
+	case 1:
+		sourceBranch = validBranches[0]
+	default:
+		msg := fmt.Sprintf("⚠️ Multiple valid branch labels found: %v. Only one allowed.", validBranches)
+		AddCommentToIssue(r.Context(), event.Project.ID, event.ObjectAttributes.IID, msg)
+		log.Printf("Multiple valid branch labels: %v", validBranches)
+		http.Error(w, "Multiple valid branch labels", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("Issue %d: trigger_label=%s, candidates=%v, valid_branches=%v, selected_branch=%s",
+		event.ObjectAttributes.IID, triggerLabel, candidates, validBranches, sourceBranch)
 
 	queue, err := LoadQueue()
 	if err != nil {
@@ -86,13 +102,53 @@ func IssueHandler(w http.ResponseWriter, r *http.Request, event IssueEvent) {
 		return
 	}
 
-	if isProjectInQueue(queue, event.Project.ID) {
-		log.Printf("Skipping issue event: project %s already in queue", event.Project.PathWithNamespace)
+	if IsProjectInQueue(queue, event.Project.ID) {
+		// Update existing queue entry with new branch
+		updated := false
+
+		// Update NightlyQueue entry
+		for i := range queue.NightlyQueue {
+			if queue.NightlyQueue[i].ProjectID == event.Project.ID {
+				queue.NightlyQueue[i].SourceBranch = sourceBranch
+				queue.NightlyQueue[i].TriggerTime = time.Now()
+				queue.NightlyQueue[i].TriggerIssueIID = event.ObjectAttributes.IID
+				queue.NightlyQueue[i].TriggerType = "manual_issue_reopen"
+				updated = true
+				log.Printf("Updated NightlyQueue entry for %s with branch=%s", event.Project.PathWithNamespace, sourceBranch)
+				break
+			}
+		}
+
+		// Update InProgress if present (affects next resume)
+		if !updated && queue.InProgress != nil && queue.InProgress.ProjectID == event.Project.ID {
+			queue.InProgress.SourceBranch = sourceBranch
+			queue.InProgress.TriggerIssueIID = event.ObjectAttributes.IID
+			queue.InProgress.TriggerType = "manual_issue_reopen"
+			updated = true
+			log.Printf("Updated InProgress scan for %s with branch=%s (will use on next resume)", event.Project.PathWithNamespace, sourceBranch)
+		}
+
+		if updated {
+			if err := SaveQueue(queue); err != nil {
+				log.Printf("Failed to save queue after branch update: %v", err)
+			}
+		}
+
+		// Post reopen comment with branch info
+		msg := "🔄 Issue reopened — added to nightly scan queue"
+		if sourceBranch != "" {
+			msg += fmt.Sprintf(" (branch: %s)", sourceBranch)
+		}
+		if err := AddCommentToIssue(r.Context(), event.Project.ID, event.ObjectAttributes.IID, msg); err != nil {
+			log.Printf("Failed to add reopen comment: %v", err)
+		}
+
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "skipped",
-			"project": event.Project.PathWithNamespace,
-			"reason":  "already in queue",
+			"status":   "updated",
+			"project":  event.Project.PathWithNamespace,
+			"branch":   sourceBranch,
+			"reason":   "updated existing queue entry",
 		})
 		return
 	}
@@ -104,6 +160,7 @@ func IssueHandler(w http.ResponseWriter, r *http.Request, event IssueEvent) {
 		TriggerIssueIID:   event.ObjectAttributes.IID,
 		TriggerType:       "manual_issue",
 		BasePriority:      0,
+		SourceBranch:      sourceBranch,
 	}
 	if event.ObjectAttributes.Action == "reopen" {
 		entry.TriggerType = "manual_issue_reopen"
@@ -118,17 +175,21 @@ func IssueHandler(w http.ResponseWriter, r *http.Request, event IssueEvent) {
 
 	if event.ObjectAttributes.Action == "reopen" {
 		msg := "🔄 Issue reopened — added to nightly scan queue"
+		if sourceBranch != "" {
+			msg += fmt.Sprintf(" (branch: %s)", sourceBranch)
+		}
 		if err := AddCommentToIssue(r.Context(), event.Project.ID, event.ObjectAttributes.IID, msg); err != nil {
 			log.Printf("Failed to add reopen comment: %v", err)
 		}
 	}
 
-	log.Printf("Queued project for nightly scan: %s (trigger issue #%d)", event.Project.PathWithNamespace, event.ObjectAttributes.IID)
+	log.Printf("Queued project for nightly scan: %s (trigger issue #%d, branch=%s)", event.Project.PathWithNamespace, event.ObjectAttributes.IID, sourceBranch)
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":   "queued",
 		"project":  event.Project.PathWithNamespace,
+		"branch":   sourceBranch,
 		"position": len(queue.NightlyQueue),
 	})
 }
@@ -197,6 +258,14 @@ func NoteHandler(w http.ResponseWriter, r *http.Request, event NoteEvent) {
 
 	log.Printf("Note text: raw=%q clean=%q", event.ObjectAttributes.Note, noteClean)
 
+	// Skip bot-generated comments to avoid infinite loops
+	if isBotGeneratedComment(event.ObjectAttributes.Note) {
+		log.Printf("Skipping note event: bot-generated comment")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": "bot comment"})
+		return
+	}
+
 	triggerPhrase := strings.ToLower(scanConfig.RescanTriggerPhrase)
 	if !strings.Contains(noteClean, triggerPhrase) {
 		log.Printf("Skipping note event: trigger phrase %q not found (clean=%q)", triggerPhrase, noteClean)
@@ -205,10 +274,28 @@ func NoteHandler(w http.ResponseWriter, r *http.Request, event NoteEvent) {
 		return
 	}
 
+	// Parse branch from suffix (everything after action word)
+	parts := strings.Fields(noteClean)
+	sourceBranch := ""
+	if len(parts) >= 3 {
+		sourceBranch = strings.Join(parts[2:], " ")
+	}
+
+	// Validate branch if specified
+	if sourceBranch != "" {
+		if err := ValidateBranch(r.Context(), gitlabURL, gitlabToken, event.Project.PathWithNamespace, sourceBranch); err != nil {
+			msg := fmt.Sprintf("⚠️ Branch validation failed: %v", err)
+			AddCommentToIssue(r.Context(), event.Project.ID, event.Issue.IID, msg)
+			log.Printf("Branch validation failed: %v", err)
+			http.Error(w, "Branch validation failed", http.StatusBadRequest)
+			return
+		}
+	}
+
 	switch {
 	case strings.Contains(noteClean, "review"):
-		log.Printf("Immediate review triggered via comment on issue #%d", event.Issue.IID)
-		if err := TriggerImmediateScan(r.Context(), event.Project.ID, event.Project.PathWithNamespace, event.Issue.IID); err != nil {
+		log.Printf("Immediate review triggered via comment on issue #%d (branch=%s)", event.Issue.IID, sourceBranch)
+		if err := TriggerImmediateScan(r.Context(), event.Project.ID, event.Project.PathWithNamespace, event.Issue.IID, sourceBranch); err != nil {
 			log.Printf("Failed to trigger immediate scan: %v", err)
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return
@@ -217,12 +304,13 @@ func NoteHandler(w http.ResponseWriter, r *http.Request, event NoteEvent) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  "accepted",
 			"project": event.Project.PathWithNamespace,
+			"branch":  sourceBranch,
 			"type":    "immediate_review",
 		})
 
 	case strings.Contains(noteClean, "rescan"):
-		log.Printf("Nightly rescan queued via comment on issue #%d", event.Issue.IID)
-		if err := TriggerRescanOnComment(r.Context(), event.Project.ID, event.Project.PathWithNamespace, event.Issue.IID); err != nil {
+		log.Printf("Nightly rescan queued via comment on issue #%d (branch=%s)", event.Issue.IID, sourceBranch)
+		if err := TriggerRescanOnComment(r.Context(), event.Project.ID, event.Project.PathWithNamespace, event.Issue.IID, sourceBranch); err != nil {
 			log.Printf("Failed to trigger rescan: %v", err)
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return
@@ -231,6 +319,7 @@ func NoteHandler(w http.ResponseWriter, r *http.Request, event NoteEvent) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  "queued",
 			"project": event.Project.PathWithNamespace,
+			"branch":  sourceBranch,
 			"type":    "rescan",
 		})
 
@@ -252,6 +341,56 @@ func isProjectInQueue(queue *NightlyQueue, projectID int) bool {
 	}
 	for _, c := range queue.CompletedThisNight {
 		if c.ProjectID == projectID {
+			return true
+		}
+	}
+	return false
+}
+
+// parseLabels extracts trigger label and all non-trigger labels as branch candidates.
+// Returns trigger label, candidate labels, and error if no trigger label found.
+func parseLabels(labels []struct{ Title string `json:"title"` }, triggerLabels []string) (string, []string, error) {
+	var triggerLabel string
+	var candidates []string
+
+	for _, label := range labels {
+		isTrigger := false
+		for _, tl := range triggerLabels {
+			if strings.EqualFold(label.Title, tl) {
+				isTrigger = true
+				triggerLabel = label.Title
+				break
+			}
+		}
+		if isTrigger {
+			continue
+		}
+		// All non-trigger labels are branch candidates (no heuristic filtering)
+		candidates = append(candidates, label.Title)
+	}
+
+	if triggerLabel == "" {
+		return "", nil, fmt.Errorf("no trigger label found")
+	}
+	return triggerLabel, candidates, nil
+}
+
+// isBotGeneratedComment checks if a comment was generated by the bot.
+// Returns true if the comment matches known bot-generated patterns.
+func isBotGeneratedComment(note string) bool {
+	noteLower := strings.ToLower(note)
+	botPatterns := []string{
+		"issue reopened — added to nightly scan queue",
+		"scan completed - no issues found",
+		"scan complete —",
+		"immediate review triggered",
+		"nightly rescan queued",
+		"branch validation failed",
+		"multiple branch labels found",
+		"superseded by new scan",
+	}
+	for _, pattern := range botPatterns {
+		if strings.Contains(noteLower, pattern) {
 			return true
 		}
 	}

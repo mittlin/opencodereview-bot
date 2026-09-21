@@ -52,7 +52,7 @@ func LoadConfig() *Config {
 		SeverityThreshold:      GetEnvWithDefault("OCR_ISSUE_SEVERITY_THRESHOLD", "warning"),
 		TriggerLabels:          triggerLabels,
 		AutoCloseOnCleanRescan: GetEnvWithDefault("OCR_AUTO_CLOSE_ON_CLEAN_RESCAN", "true") == "true",
-		RescanTriggerPhrase:    GetEnvWithDefault("OCR_RESCAN_TRIGGER_PHRASE", "@ocr-bot review"),
+		RescanTriggerPhrase:    GetEnvWithDefault("OCR_RESCAN_TRIGGER_PHRASE", "@ocr-bot"),
 	}
 }
 
