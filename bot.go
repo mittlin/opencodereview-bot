@@ -570,7 +570,14 @@ func runReviewWithRepoDir(ctx context.Context, req ReviewRequest, repoDir string
 	}
 	// Priority: FromSHA+CommitSHA > CommitSHA > from target branch
 	if req.FromSHA != "" && req.CommitSHA != "" {
-		args = append(args, "--from", req.FromSHA, "--to", req.CommitSHA)
+		// Verify FromSHA exists in the cloned repo (shallow clone may not have it)
+		cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "cat-file", "-t", req.FromSHA)
+		if cmd.Run() == nil {
+			args = append(args, "--from", req.FromSHA, "--to", req.CommitSHA)
+		} else {
+			log.Printf("FromSHA %s not found in clone, falling back to target branch %s", req.FromSHA, req.TargetBranch)
+			args = append(args, "--from", "origin/"+req.TargetBranch, "--to", req.CommitSHA)
+		}
 	} else if req.CommitSHA != "" {
 		args = append(args, "--commit", req.CommitSHA)
 	} else {
