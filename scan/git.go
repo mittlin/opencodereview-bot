@@ -202,3 +202,39 @@ func ValidateBranch(ctx context.Context, gitlabURL, gitlabToken, projectPath, br
 	}
 	return nil
 }
+
+// ExtractBranchFromNote extracts branch from note preserving original case.
+// triggerPhrase: e.g. "@ocr-bot review" from OCR_RESCAN_TRIGGER_PHRASE config.
+// Uses case-insensitive match for trigger phrase but preserves original case of branch.
+func ExtractBranchFromNote(note, triggerPhrase string) string {
+	lowerNote := strings.ToLower(note)
+	lowerTrigger := strings.ToLower(triggerPhrase)
+	idx := strings.Index(lowerNote, lowerTrigger)
+	if idx == -1 {
+		return ""
+	}
+	branchPart := strings.TrimSpace(note[idx+len(triggerPhrase):])
+	return branchPart
+}
+
+// ResolveBranch validates candidates via git ls-remote.
+// Returns: (branch, error) where:
+//   - branch="" + nil error = default branch (0 valid)
+//   - branch="X" + nil error = use branch X (1 valid)
+//   - branch="" + error = multiple valid branches (>1 valid)
+func ResolveBranch(ctx context.Context, gitlabURL, gitlabToken, projectPath string, candidates []string) (string, error) {
+	var validBranches []string
+	for _, candidate := range candidates {
+		if err := ValidateBranch(ctx, gitlabURL, gitlabToken, projectPath, candidate); err == nil {
+			validBranches = append(validBranches, candidate)
+		}
+	}
+	switch len(validBranches) {
+	case 0:
+		return "", nil // default branch
+	case 1:
+		return validBranches[0], nil
+	default:
+		return "", fmt.Errorf("multiple valid branch labels found: %v. Only one allowed.", validBranches)
+	}
+}

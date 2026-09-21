@@ -67,33 +67,19 @@ func IssueHandler(w http.ResponseWriter, r *http.Request, event IssueEvent) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": err.Error()})
 		return
-	}
-
-	// Validate each candidate branch via git ls-remote
-	var validBranches []string
-	for _, candidate := range candidates {
-		if err := ValidateBranch(r.Context(), gitlabURL, gitlabToken, event.Project.PathWithNamespace, candidate); err == nil {
-			validBranches = append(validBranches, candidate)
-		}
-	}
-
-	// Resolve branch
-	var sourceBranch string
-	switch len(validBranches) {
-	case 0:
-		sourceBranch = "" // default branch
-	case 1:
-		sourceBranch = validBranches[0]
-	default:
-		msg := fmt.Sprintf("⚠️ Multiple valid branch labels found: %v. Only one allowed.", validBranches)
+}
+	// Resolve branch via ResolveBranch (validates each candidate via git ls-remote)
+	sourceBranch, err := ResolveBranch(r.Context(), gitlabURL, gitlabToken, event.Project.PathWithNamespace, candidates)
+	if err != nil {
+		msg := fmt.Sprintf("⚠️ %v", err)
 		AddCommentToIssue(r.Context(), event.Project.ID, event.ObjectAttributes.IID, msg)
-		log.Printf("Multiple valid branch labels: %v", validBranches)
+		log.Printf("Multiple valid branch labels: %v", candidates)
 		http.Error(w, "Multiple valid branch labels", http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("Issue %d: trigger_label=%s, candidates=%v, valid_branches=%v, selected_branch=%s",
-		event.ObjectAttributes.IID, triggerLabel, candidates, validBranches, sourceBranch)
+	log.Printf("Issue %d: trigger_label=%s, candidates=%v, selected_branch=%s",
+		event.ObjectAttributes.IID, triggerLabel, candidates, sourceBranch)
 
 	queue, err := LoadQueue()
 	if err != nil {
@@ -274,23 +260,19 @@ func NoteHandler(w http.ResponseWriter, r *http.Request, event NoteEvent) {
 		return
 	}
 
-	// Parse branch from suffix (everything after action word)
-	parts := strings.Fields(noteClean)
-	sourceBranch := ""
-	if len(parts) >= 3 {
-		sourceBranch = strings.Join(parts[2:], " ")
-	}
+	// Extract branch from original note (preserving case) using trigger phrase from config
+	sourceBranch := ExtractBranchFromNote(event.ObjectAttributes.Note, scanConfig.RescanTriggerPhrase)
 
-	// Validate branch if specified
-	if sourceBranch != "" {
-		if err := ValidateBranch(r.Context(), gitlabURL, gitlabToken, event.Project.PathWithNamespace, sourceBranch); err != nil {
-			msg := fmt.Sprintf("⚠️ Branch validation failed: %v", err)
-			AddCommentToIssue(r.Context(), event.Project.ID, event.Issue.IID, msg)
-			log.Printf("Branch validation failed: %v", err)
-			http.Error(w, "Branch validation failed", http.StatusBadRequest)
-			return
-		}
+	// Validate branch via ResolveBranch (handles 0/1/>1 valid branches consistently)
+	validBranch, err := ResolveBranch(r.Context(), gitlabURL, gitlabToken, event.Project.PathWithNamespace, []string{sourceBranch})
+	if err != nil {
+		msg := fmt.Sprintf("⚠️ %v", err)
+		AddCommentToIssue(r.Context(), event.Project.ID, event.Issue.IID, msg)
+		log.Printf("Multiple valid branch labels: %v", []string{sourceBranch})
+		http.Error(w, "Multiple valid branch labels", http.StatusBadRequest)
+		return
 	}
+	sourceBranch = validBranch // empty string = default branch
 
 	switch {
 	case strings.Contains(noteClean, "review"):
