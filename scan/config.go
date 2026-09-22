@@ -65,6 +65,9 @@ func ConfigLLM(ctx context.Context) {
 	llmToken := os.Getenv("LLM_TOKEN")
 	llmModel := os.Getenv("LLM_MODEL")
 	language := os.Getenv("OCR_LANGUAGE")
+	if language == "" {
+		language = "Chinese"
+	}
 
 	configs := map[string]string{
 		"llm.url":           llmURL,

@@ -61,15 +61,17 @@ func AppendOCRArgs(args []string, maxTokensBudget, effort, provider string) []st
 }
 
 // BuildOCREnv builds the environment variables for OCR execution.
-func BuildOCREnv(llmURL, llmToken, llmModel, extraKey, extraVal string) []string {
+func BuildOCREnv(llmURL, llmToken, llmModel string, extraEnv map[string]string) []string {
 	env := append(os.Environ(),
 		"OCR_LLM_URL="+llmURL,
 		"OCR_LLM_TOKEN="+llmToken,
 		"OCR_LLM_MODEL="+llmModel,
 		"HOME="+OCRHomeDir,
 	)
-	if extraKey != "" {
-		env = append(env, extraKey+"="+extraVal)
+	for k, v := range extraEnv {
+		if k != "" && v != "" {
+			env = append(env, k+"="+v)
+		}
 	}
 	return env
 }

@@ -148,6 +148,37 @@ type submoduleHost struct {
 	host   string // hostname without port/path
 }
 
+// CheckSubmoduleCloned checks if a submodule directory exists and has content
+func CheckSubmoduleCloned(repoDir, submodulePath string) bool {
+	subDir := filepath.Join(repoDir, submodulePath)
+	entries, err := os.ReadDir(subDir)
+	if err != nil || len(entries) == 0 {
+		return false
+	}
+	// Check if it's a valid git repo (has .git file or dir)
+	_, err = os.Stat(filepath.Join(subDir, ".git"))
+	return err == nil
+}
+
+// GetSubmodulePaths returns paths of all submodules from .gitmodules
+func GetSubmodulePaths(repoDir string) []string {
+	data, err := os.ReadFile(filepath.Join(repoDir, ".gitmodules"))
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	re := regexp.MustCompile(`(?i)^\s*path\s*=\s*(.+)$`)
+	for line := range strings.SplitSeq(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "path") {
+			matches := re.FindStringSubmatch(line)
+			if len(matches) == 2 {
+				paths = append(paths, strings.TrimSpace(matches[1]))
+			}
+		}
+	}
+	return paths
+}
 // parseGitmodulesHosts extracts unique (scheme, host) pairs from .gitmodules URLs.
 func parseGitmodulesHosts(repoDir string) []submoduleHost {
 	data, err := os.ReadFile(filepath.Join(repoDir, ".gitmodules"))

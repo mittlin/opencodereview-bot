@@ -542,6 +542,16 @@ func runReviewWithRepoDir(ctx context.Context, req ReviewRequest, repoDir string
 		}
 	}
 
+	// Check submodule status: exclude submodules that failed to clone
+	submodulePaths := scan.GetSubmodulePaths(repoDir)
+	var excludePatterns []string
+	for _, path := range submodulePaths {
+		if !scan.CheckSubmoduleCloned(repoDir, path) {
+			log.Printf("Submodule %s failed to clone, excluding from review", path)
+			excludePatterns = append(excludePatterns, path+"/**")
+		}
+	}
+
 	scan.ConfigLLM(ctx)
 
 	// Generate review ID with project path and commit SHA for readability
@@ -587,10 +597,18 @@ func runReviewWithRepoDir(ctx context.Context, req ReviewRequest, repoDir string
 	if len(req.ExcludePaths) > 0 {
 		args = append(args, "--exclude", strings.Join(req.ExcludePaths, ","))
 	}
+	// Add submodule exclude patterns for failed clones
+	if len(excludePatterns) > 0 {
+		args = append(args, "--exclude", strings.Join(excludePatterns, ","))
+	}
 
 	args = scan.AppendOCRArgs(args, maxTokensBudget, effort, provider)
 
-	env := scan.BuildOCREnv(llmURL, llmToken, llmModel, "OCR_LLM_TIMEOUT", llmTimeout)
+	language := scan.GetEnvWithDefault("OCR_LANGUAGE", "Chinese")
+	env := scan.BuildOCREnv(llmURL, llmToken, llmModel, map[string]string{
+		"OCR_LLM_TIMEOUT": llmTimeout,
+		"OCR_LANGUAGE":    language,
+	})
 	comments, summary, err := scan.RunOCR(ctx, args, env, outputPath)
 	if err != nil {
 		return nil, err
