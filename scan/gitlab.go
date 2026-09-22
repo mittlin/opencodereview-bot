@@ -340,7 +340,7 @@ func TriggerRescanOnComment(ctx context.Context, projectID int, pathWithNamespac
 		return fmt.Errorf("load queue: %w", err)
 	}
 
-	if isProjectInQueue(queue, projectID) {
+	if IsProjectInQueue(queue, projectID) {
 		log.Printf("Project %s already in queue, skipping", pathWithNamespace)
 		return nil
 	}
@@ -375,7 +375,7 @@ func TriggerImmediateScan(ctx context.Context, projectID int, pathWithNamespace 
 		if err != nil {
 			return fmt.Errorf("load queue: %w", err)
 		}
-		if isProjectInQueue(queue, projectID) {
+if IsProjectInQueue(queue, projectID) {
 			return nil
 		}
 		entry := PriorityEntry{

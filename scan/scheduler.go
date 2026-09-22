@@ -188,7 +188,7 @@ func runNightlyScan(botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenV
 			if c.IssueIID > 0 || c.Findings > 0 {
 				meta.ProjectsSucceeded++
 			} else {
-				meta.ProjectsSucceeded++
+				meta.ProjectsFailed++
 			}
 		}
 		meta.NextScheduledRun = nextRun
@@ -529,7 +529,10 @@ func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, file
 	}
 	args = AppendOCRArgs(args, maxTokensBudget, effort, provider)
 
-	env := BuildOCREnv(llmURL, llmToken, llmModel, "OCR_LANGUAGE", language)
+	env := BuildOCREnv(llmURL, llmToken, llmModel, map[string]string{
+		"OCR_LANGUAGE":     language,
+		"OCR_LLM_TIMEOUT":  fmt.Sprintf("%d", cfg.ChunkTimeout*60),
+	})
 	return RunOCR(ctx, args, env, outputFile)
 }
 

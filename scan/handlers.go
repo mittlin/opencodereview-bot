@@ -260,8 +260,24 @@ func NoteHandler(w http.ResponseWriter, r *http.Request, event NoteEvent) {
 		return
 	}
 
-	// Extract branch from original note (preserving case) using trigger phrase from config
-	sourceBranch := ExtractBranchFromNote(event.ObjectAttributes.Note, scanConfig.RescanTriggerPhrase)
+	// Detect action word first to construct full trigger phrase for branch extraction
+	// Use exact word matching on cleaned note (punctuation stripped, lowercased)
+	actionWord := ""
+	words := strings.Fields(noteClean)
+	for _, w := range words {
+		if w == "review" {
+			actionWord = "review"
+			break
+		}
+		if w == "rescan" {
+			actionWord = "rescan"
+			break
+		}
+	}
+
+	// Extract branch from original note using full trigger phrase (bot mention + action word)
+	fullTrigger := scanConfig.RescanTriggerPhrase + " " + actionWord
+	sourceBranch := ExtractBranchFromNote(event.ObjectAttributes.Note, fullTrigger)
 
 	// Validate branch via ResolveBranch (handles 0/1/>1 valid branches consistently)
 	validBranch, err := ResolveBranch(r.Context(), gitlabURL, gitlabToken, event.Project.PathWithNamespace, []string{sourceBranch})
@@ -275,7 +291,7 @@ func NoteHandler(w http.ResponseWriter, r *http.Request, event NoteEvent) {
 	sourceBranch = validBranch // empty string = default branch
 
 	switch {
-	case strings.Contains(noteClean, "review"):
+	case actionWord == "review":
 		log.Printf("Immediate review triggered via comment on issue #%d (branch=%s)", event.Issue.IID, sourceBranch)
 		if err := TriggerImmediateScan(r.Context(), event.Project.ID, event.Project.PathWithNamespace, event.Issue.IID, sourceBranch); err != nil {
 			log.Printf("Failed to trigger immediate scan: %v", err)
@@ -290,7 +306,7 @@ func NoteHandler(w http.ResponseWriter, r *http.Request, event NoteEvent) {
 			"type":    "immediate_review",
 		})
 
-	case strings.Contains(noteClean, "rescan"):
+	case actionWord == "rescan":
 		log.Printf("Nightly rescan queued via comment on issue #%d (branch=%s)", event.Issue.IID, sourceBranch)
 		if err := TriggerRescanOnComment(r.Context(), event.Project.ID, event.Project.PathWithNamespace, event.Issue.IID, sourceBranch); err != nil {
 			log.Printf("Failed to trigger rescan: %v", err)
@@ -310,23 +326,6 @@ func NoteHandler(w http.ResponseWriter, r *http.Request, event NoteEvent) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "skipped", "reason": "no matching action word"})
 	}
-}
-
-func isProjectInQueue(queue *NightlyQueue, projectID int) bool {
-	for _, e := range queue.NightlyQueue {
-		if e.ProjectID == projectID {
-			return true
-		}
-	}
-	if queue.InProgress != nil && queue.InProgress.ProjectID == projectID {
-		return true
-	}
-	for _, c := range queue.CompletedThisNight {
-		if c.ProjectID == projectID {
-			return true
-		}
-	}
-	return false
 }
 
 // parseLabels extracts trigger label and all non-trigger labels as branch candidates.
