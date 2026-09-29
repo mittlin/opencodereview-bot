@@ -401,7 +401,7 @@ func TriggerImmediateScan(ctx context.Context, projectID int, pathWithNamespace 
 			BasePriority:      200,
 			SourceBranch:      sourceBranch,
 		}
-		queue.NightlyQueue = append(queue.NightlyQueue, entry)
+		AddToImmediateQueue(queue, entry)
 		return SaveQueue(queue)
 	}
 

@@ -55,6 +55,7 @@ type ScanProgress struct {
 
 type NightlyQueue struct {
 	NightlyQueue       []PriorityEntry   `json:"nightly_queue"`
+	ImmediateQueue     []PriorityEntry   `json:"immediate_queue"`
 	InProgress         *ScanProgress     `json:"in_progress,omitempty"`
 	CompletedThisNight []CompletedEntry  `json:"completed_this_night"`
 }
@@ -123,6 +124,9 @@ func LoadQueue() (*NightlyQueue, error) {
 	}
 	if queue.NightlyQueue == nil {
 		queue.NightlyQueue = []PriorityEntry{}
+	}
+	if queue.ImmediateQueue == nil {
+		queue.ImmediateQueue = []PriorityEntry{}
 	}
 	if queue.CompletedThisNight == nil {
 		queue.CompletedThisNight = []CompletedEntry{}
@@ -199,6 +203,11 @@ func IsProjectInQueue(queue *NightlyQueue, projectID int) bool {
 			return true
 		}
 	}
+	for _, e := range queue.ImmediateQueue {
+		if e.ProjectID == projectID {
+			return true
+		}
+	}
 	if queue.InProgress != nil && queue.InProgress.ProjectID == projectID {
 		return true
 	}
@@ -225,4 +234,20 @@ func GetTaskSemaphore(concurrency int) chan struct{} {
 		taskSemaphore = make(chan struct{}, concurrency)
 	})
 	return taskSemaphore
+}
+
+// PopImmediateQueue removes and returns the first entry from the immediate queue.
+// Returns nil if queue is empty.
+func PopImmediateQueue(queue *NightlyQueue) *PriorityEntry {
+	if len(queue.ImmediateQueue) == 0 {
+		return nil
+	}
+	entry := queue.ImmediateQueue[0]
+	queue.ImmediateQueue = queue.ImmediateQueue[1:]
+	return &entry
+}
+
+// AddToImmediateQueue adds an entry to the immediate queue.
+func AddToImmediateQueue(queue *NightlyQueue, entry PriorityEntry) {
+	queue.ImmediateQueue = append(queue.ImmediateQueue, entry)
 }

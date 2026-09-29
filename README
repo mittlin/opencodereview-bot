@@ -128,6 +128,8 @@ docker run -d --name ocr-bot \
 | `OCR_MAX_TOKENS_BUDGET` | 否 | — | 总 token 预算限制 |
 | `OCR_EFFORT` | 否 | — | 审查 effort 预设：low/medium/high |
 | `OCR_PROVIDER` | 否 | — | LLM provider 覆盖 |
+| `OCR_TASK_CONCURRENCY` | 否 | `1` | 最大并发审查任务数（所有事件类型共享） |
+| `OCR_SCAN_CONCURRENCY` | 否 | `1` | `ocr scan` 并发文件组工作数 |
 | `PORT` | 否 | `9999` | Bot 监听端口 |
 
 #### 定时扫描配置（Nightly Scan）
@@ -145,6 +147,8 @@ docker run -d --name ocr-bot \
 | `OCR_ISSUE_TRIGGER_LABELS` | 否 | `ocr-scan,ocr-trigger` | 触发扫描的 Issue 标签 |
 | `OCR_AUTO_CLOSE_ON_CLEAN_RESCAN` | 否 | `true` | 清洁扫描后自动关闭 Issue |
 | `OCR_RESCAN_TRIGGER_PHRASE` | 否 | `@ocr-bot review` | 评论触发短语 |
+| `OCR_TASK_CONCURRENCY` | 否 | `1` | 最大并发审查任务数（含即时/定时/手动） |
+| `OCR_SCAN_CONCURRENCY` | 否 | `1` | 扫描时的并发文件组数 |
 
 ---
 
@@ -242,9 +246,9 @@ Bot 使用单一端点 `/webhook`，根据 GitLab 发送的 `object_kind` 字段
 ### 4.5 Note events（即时扫描）
 
 - **触发条件**: 在 Issue 上评论，包含触发短语
-- **`@ocr-bot review`**: 立即扫描该 Issue 所在项目，结果写入 Issue 评论
+- **`@ocr-bot review`**: 立即扫描该 Issue 所在项目，结果写入 Issue 评论（后台工作器 5 秒轮询处理队列）
 - **`@ocr-bot rescan`**: 将项目加入定时扫描队列
-- **并发限制**: 同一时间只能运行 1 个即时扫描
+- **并发限制**: 由 `OCR_TASK_CONCURRENCY` 控制（默认 1），所有审查类型共享
 
 ---
 
@@ -264,6 +268,7 @@ Bot 使用单一端点 `/webhook`，根据 GitLab 发送的 `object_kind` 字段
 |------|------|
 | `ocr-result` | 扫描结果 Issue |
 | `nightly-scan` | 标记为定时扫描产生 |
+| `immediate-review` | 标记为即时扫描产生（`@ocr-bot review`） |
 | `file:<filename>` | 文件级标签（如 `file:main.go`） |
 
 ### 5.3 自动关闭流程
@@ -337,6 +342,11 @@ docker build -t ocr-bot:latest .
 docker run -d --name ocr-bot ...  # 使用之前的启动命令
 ```
 
+### 6.10 即时扫描排队但不执行
+
+检查 `OCR_TASK_CONCURRENCY` 是否设置过小，或是否有其他审查任务长时间占用。
+即时扫描队列由后台工作器每 5 秒轮询处理，不再等待定时任务。
+
 ---
 
 ## 7. 版本信息
@@ -369,9 +379,14 @@ GitLab (http://xxxx)
 │  /health (健康检查)                                │
 │                                                  │
 │  ┌─ Nightly Scheduler (cron 0 21 * * *) ─────┐  │
-│  │  遍历队列 → Clone → 分块 → OCR scan       │  │
-│  │  → 按文件创建 Issue → 关闭旧 Issue          │  │
-│  │  → 发布汇总评论到触发 Issue                  │  │
+│  │  遍历夜间队列 → Clone → 分块 → OCR scan   │  │
+│  │  → 按文件创建 Issue → 关闭旧 Issue         │  │
+│  │  → 发布汇总评论到触发 Issue                 │  │
+│  └───────────────────────────────────────────┘  │
+│  ┌─ Immediate Worker (5s polling) ──────────┐  │
+│  │  轮询即时队列 → 获取信号量 → OCR scan     │  │
+│  │  → 按文件创建 Issue (immediate-review)    │  │
+│  │  → 发布汇总评论到触发 Issue                 │  │
 │  └───────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────┘
     │

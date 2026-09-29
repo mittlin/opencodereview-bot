@@ -49,6 +49,9 @@ func StartScheduler(ctx context.Context, botToken, gitlabURLVal, gitlabTokenVal,
 	c.Start()
 	log.Printf("Nightly scan scheduler started with cron: %s", LoadConfig().CronExpr)
 
+	// Start immediate queue worker
+	StartImmediateQueueWorker(botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
@@ -58,6 +61,7 @@ func StartScheduler(ctx context.Context, botToken, gitlabURLVal, gitlabTokenVal,
 		if scanCancelFunc != nil {
 			scanCancelFunc()
 		}
+		StopImmediateQueueWorker()
 		schedulerMu.Lock()
 		schedulerRunning = false
 		schedulerMu.Unlock()
@@ -580,4 +584,95 @@ func runImmediateScan(ctx context.Context, entry PriorityEntry, cfg *Config, bot
 	}
 
 	return scanChunksAndReport(ctx, entry, cfg, allComments, allSummaries, scanSuccessful, gitlabURLVal, gitlabTokenVal, "Immediate Review Report")
+}
+
+var (
+	immediateWorkerCancel context.CancelFunc
+	immediateWorkerWG     sync.WaitGroup
+)
+
+// StartImmediateQueueWorker starts a background worker that processes the immediate queue.
+// It polls the queue every 5 seconds and runs immediate reviews using the shared semaphore.
+func StartImmediateQueueWorker(botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	immediateWorkerCancel = cancel
+
+	immediateWorkerWG.Add(1)
+	go func() {
+		defer immediateWorkerWG.Done()
+		log.Println("Immediate queue worker started")
+
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Immediate queue worker stopped")
+				return
+			case <-ticker.C:
+				processImmediateQueue(ctx, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
+			}
+		}
+	}()
+}
+
+// StopImmediateQueueWorker stops the immediate queue worker.
+func StopImmediateQueueWorker() {
+	if immediateWorkerCancel != nil {
+		immediateWorkerCancel()
+		immediateWorkerWG.Wait()
+		immediateWorkerCancel = nil
+	}
+}
+
+// processImmediateQueue processes one entry from the immediate queue if a semaphore slot is available.
+func processImmediateQueue(ctx context.Context, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal string) {
+	cfg := LoadConfig()
+	sem := GetTaskSemaphore(cfg.ReviewConcurrency)
+
+	// Try to acquire semaphore without blocking
+	select {
+	case sem <- struct{}{}:
+		// Got semaphore, process one entry
+		queue, err := LoadQueue()
+		if err != nil {
+			log.Printf("Failed to load queue for immediate worker: %v", err)
+			<-sem // Release semaphore
+			return
+		}
+
+		entry := PopImmediateQueue(queue)
+		if entry == nil {
+			<-sem // Release semaphore, no work
+			return
+		}
+
+		log.Printf("Immediate queue worker processing: %s (trigger: %s)", entry.PathWithNamespace, entry.TriggerType)
+
+		if err := SaveQueue(queue); err != nil {
+			log.Printf("Failed to save queue after popping immediate entry: %v", err)
+		}
+
+		// Run the immediate scan
+		go func() {
+			defer func() { <-sem }()
+
+			result, err := runImmediateScan(ctx, *entry, cfg, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
+			if err != nil {
+				log.Printf("Immediate review failed for %s: %v", entry.PathWithNamespace, err)
+				return
+			}
+
+			if result != nil && len(result.Comments) > 0 {
+				log.Printf("Immediate review found %d issues in %s", len(result.Comments), entry.PathWithNamespace)
+			} else if result != nil {
+				log.Printf("Immediate review completed for %s (no issues found or scan failed)", entry.PathWithNamespace)
+			}
+		}()
+
+	default:
+		// Semaphore busy, skip this iteration
+		return
+	}
 }
