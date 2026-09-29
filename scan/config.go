@@ -27,6 +27,8 @@ type Config struct {
 	TriggerLabels            []string
 	AutoCloseOnCleanRescan   bool
 	RescanTriggerPhrase      string
+	ReviewConcurrency        int
+	ScanConcurrency          int
 }
 
 func LoadConfig() *Config {
@@ -53,6 +55,8 @@ func LoadConfig() *Config {
 		TriggerLabels:          triggerLabels,
 		AutoCloseOnCleanRescan: GetEnvWithDefault("OCR_AUTO_CLOSE_ON_CLEAN_RESCAN", "true") == "true",
 		RescanTriggerPhrase:    GetEnvWithDefault("OCR_RESCAN_TRIGGER_PHRASE", "@ocr-bot"),
+		ReviewConcurrency:      getEnvIntWithDefault("OCR_TASK_CONCURRENCY", 1),
+		ScanConcurrency:        getEnvIntWithDefault("OCR_SCAN_CONCURRENCY", 1),
 	}
 }
 

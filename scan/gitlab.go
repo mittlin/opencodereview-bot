@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -17,9 +16,6 @@ var (
 	gitlabURL   string
 	gitlabToken string
 	scanConfig  *Config
-
-	immediateScanMu      sync.Mutex
-	immediateScanRunning bool
 )
 
 func InitGitLabClient(url, token string, cfg *Config) {
@@ -276,11 +272,18 @@ func FindExistingFileIssues(ctx context.Context, projectID int) ([]GitLabIssue, 
 }
 
 // CreateOrUpdateFileIssue creates or updates a per-file scan issue.
-// Labels: ocr-result, nightly-scan, file:<basename>
-func CreateOrUpdateFileIssue(ctx context.Context, projectID int, filePath, body string, triggerIssueIID int) (int, error) {
+// Labels: ocr-result, nightly-scan/immediate-review, file:<basename>
+func CreateOrUpdateFileIssue(ctx context.Context, projectID int, filePath, body string, triggerIssueIID int, triggerType string) (int, error) {
 	baseName := GetFileBaseName(filePath)
 	fileLabel := "file:" + baseName
-	ocrLabels := []string{"ocr-result", "nightly-scan", fileLabel}
+
+	var scanTypeLabel string
+	if triggerType == "immediate_review" {
+		scanTypeLabel = "immediate-review"
+	} else {
+		scanTypeLabel = "nightly-scan"
+	}
+	ocrLabels := []string{"ocr-result", scanTypeLabel, fileLabel}
 
 	existing, err := FindExistingOCRIssue(ctx, projectID, ocrLabels)
 	if err != nil {
@@ -302,6 +305,7 @@ func CreateOrUpdateFileIssue(ctx context.Context, projectID int, filePath, body 
 }
 
 // CloseStaleFileIssues closes open ocr-result issues that are NOT in keepLabels.
+// Handles both nightly-scan and immediate-review label types.
 func CloseStaleFileIssues(ctx context.Context, projectID int, keepLabels map[string]bool) error {
 	existing, err := FindExistingFileIssues(ctx, projectID)
 	if err != nil {
@@ -367,15 +371,25 @@ func TriggerRescanOnComment(ctx context.Context, projectID int, pathWithNamespac
 func TriggerImmediateScan(ctx context.Context, projectID int, pathWithNamespace string, issueIID int, sourceBranch string) error {
 	log.Printf("Triggering immediate review for %s (trigger issue #%d, branch=%s)", pathWithNamespace, issueIID, sourceBranch)
 
-	immediateScanMu.Lock()
-	if immediateScanRunning {
-		immediateScanMu.Unlock()
+	cfg := LoadConfig()
+	sem := GetTaskSemaphore(cfg.ReviewConcurrency)
+
+	// Try to acquire semaphore immediately
+	select {
+	case sem <- struct{}{}:
+		// Got the slot, run immediately
+		go func() {
+			defer func() { <-sem }()
+			log.Printf("Immediate review completed for %s", pathWithNamespace)
+		}()
+	default:
+		// No slot available, queue for later with priority 200
 		log.Printf("Another immediate scan is running, queueing %s for later", pathWithNamespace)
 		queue, err := LoadQueue()
 		if err != nil {
 			return fmt.Errorf("load queue: %w", err)
 		}
-if IsProjectInQueue(queue, projectID) {
+		if IsProjectInQueue(queue, projectID) {
 			return nil
 		}
 		entry := PriorityEntry{
@@ -390,17 +404,8 @@ if IsProjectInQueue(queue, projectID) {
 		queue.NightlyQueue = append(queue.NightlyQueue, entry)
 		return SaveQueue(queue)
 	}
-	immediateScanRunning = true
-	immediateScanMu.Unlock()
 
 	go func() {
-		defer func() {
-			immediateScanMu.Lock()
-			immediateScanRunning = false
-			immediateScanMu.Unlock()
-			log.Printf("Immediate review completed for %s", pathWithNamespace)
-		}()
-
 		cfg := LoadConfig()
 		botToken := os.Getenv("BOT_TOKEN")
 		gitlabURLVal := gitlabURL

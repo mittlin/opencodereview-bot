@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/alibaba/open-code-review/internal/llm"
@@ -112,10 +111,6 @@ var (
 	maxTokensBudget string
 	effort          string
 	provider        string
-
-	// Queue control
-	reviewSemaphore = make(chan struct{}, 1) // max 1 concurrent review
-	activeReviews   int32                    // current running review count
 )
 
 func main() {
@@ -195,11 +190,12 @@ func main() {
 
 // statusHandler returns current review queue status
 func statusHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := scan.LoadConfig()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":         "ok",
-		"active_reviews": atomic.LoadInt32(&activeReviews),
-		"queue_capacity": 1,
+		"active_reviews": 0, // tracked via shared semaphore
+		"queue_capacity": cfg.ReviewConcurrency,
 	})
 }
 
@@ -633,15 +629,14 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 		displayProject = fmt.Sprintf("%d", projectID)
 	}
 
-	log.Printf("Queued review: project=%s from=%s to=%s event=%s branch=%s (active=%d)",
-		displayProject, fromSHA, toSHA, eventType, sourceBranch, atomic.LoadInt32(&activeReviews))
+	cfg := scan.LoadConfig()
+	sem := scan.GetTaskSemaphore(cfg.ReviewConcurrency)
 
-	reviewSemaphore <- struct{}{}
-	atomic.AddInt32(&activeReviews, 1)
-	defer func() {
-		atomic.AddInt32(&activeReviews, -1)
-		<-reviewSemaphore
-	}()
+	log.Printf("Queued review: project=%s from=%s to=%s event=%s branch=%s",
+		displayProject, fromSHA, toSHA, eventType, sourceBranch)
+
+	sem <- struct{}{}
+	defer func() { <-sem }()
 
 	log.Printf("Starting review: project=%s from=%s to=%s event=%s branch=%s",
 		displayProject, fromSHA, toSHA, eventType, sourceBranch)

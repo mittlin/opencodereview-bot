@@ -119,7 +119,7 @@ func TestReplayScanResult(t *testing.T) {
 	for _, file := range files {
 		cs := byFile[file]
 		body := FormatFileIssueBody(cs, file, projectPath, "main", gitlabURL)
-		fiid, err := CreateOrUpdateFileIssue(context.Background(), pid, file, body, triggerIID)
+		fiid, err := CreateOrUpdateFileIssue(context.Background(), pid, file, body, triggerIID, "polling")
 		if err != nil {
 			t.Logf("Failed to create issue for %s: %v", file, err)
 			continue

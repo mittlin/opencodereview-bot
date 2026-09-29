@@ -209,3 +209,20 @@ func IsProjectInQueue(queue *NightlyQueue, projectID int) bool {
 	}
 	return false
 }
+
+var (
+	taskSemaphore chan struct{}
+	taskSemOnce   sync.Once
+)
+
+// GetTaskSemaphore returns a shared semaphore for limiting concurrent review tasks.
+// Uses sync.Once to initialize only once with the first requested concurrency.
+func GetTaskSemaphore(concurrency int) chan struct{} {
+	taskSemOnce.Do(func() {
+		if concurrency <= 0 {
+			concurrency = 1
+		}
+		taskSemaphore = make(chan struct{}, concurrency)
+	})
+	return taskSemaphore
+}

@@ -116,6 +116,8 @@ func runNightlyScan(botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenV
 		log.Printf("No triggered projects, added %d polling projects", len(projects))
 	}
 
+	sem := GetTaskSemaphore(cfg.ReviewConcurrency)
+
 	for i := 0; i < len(queue.NightlyQueue); i++ {
 		select {
 		case <-ctx.Done():
@@ -147,7 +149,13 @@ func runNightlyScan(botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenV
 
 		log.Printf("Processing project: %s (trigger: %s)", entry.PathWithNamespace, entry.TriggerType)
 
+		// Acquire semaphore for this project
+		sem <- struct{}{}
+
 		progress, err := runProjectScan(ctx, entry, cfg, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
+
+		<-sem // Release semaphore after project completes
+
 		if err != nil {
 			log.Printf("Project scan failed: %v", err)
 			continue
@@ -313,7 +321,7 @@ queue.InProgress = &ScanProgress{
 		}
 
 		log.Printf("Scanning chunk %d/%d (%d files)", idx+1, len(chunks), chunk.FileCount)
-		comments, summary, err := runScanChunk(ctx, entry, repoDir, chunk.Files, cfg, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
+		comments, summary, err := runScanChunk(ctx, entry, repoDir, chunk.Files, cfg, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal, cfg.ScanConcurrency)
 		if err != nil {
 			log.Printf("Chunk %d failed: %v", idx, err)
 			continue
@@ -421,7 +429,7 @@ func scanChunksAndReport(ctx context.Context, entry PriorityEntry, cfg *Config, 
 		keepLabels := map[string]bool{}
 		for filePath, fileComments := range byFile {
 			fileBody := FormatFileIssueBody(fileComments, filePath, entry.PathWithNamespace, branch, gitlabURLVal)
-			fiid, err := CreateOrUpdateFileIssue(ctx, entry.ProjectID, filePath, fileBody, entry.TriggerIssueIID)
+			fiid, err := CreateOrUpdateFileIssue(ctx, entry.ProjectID, filePath, fileBody, entry.TriggerIssueIID, entry.TriggerType)
 			if err != nil {
 				log.Printf("Failed to create file issue for %s: %v", filePath, err)
 			} else {
@@ -506,7 +514,7 @@ func enumerateAndChunkFiles(ctx context.Context, repoDir string, excludes []stri
 	return chunks, nil
 }
 
-func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, files []string, cfg *Config, llmURL, llmToken, llmModel, language, maxTokensBudget, effort, provider string) ([]ReviewComment, string, error) {
+func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, files []string, cfg *Config, llmURL, llmToken, llmModel, language, maxTokensBudget, effort, provider string, scanConcurrency int) ([]ReviewComment, string, error) {
 	ConfigLLM(ctx)
 
 	includeArg := strings.Join(files, ",")
@@ -522,6 +530,7 @@ func runScanChunk(ctx context.Context, entry PriorityEntry, repoDir string, file
 		"--model", llmModel,
 		"--timeout", fmt.Sprintf("%d", cfg.ChunkTimeout),
 		"--no-plan",
+		"--concurrency", fmt.Sprintf("%d", scanConcurrency),
 	}
 
 	if cfg.Excludes != "" {
@@ -561,7 +570,7 @@ func runImmediateScan(ctx context.Context, entry PriorityEntry, cfg *Config, bot
 
 	for idx, chunk := range chunks {
 		log.Printf("Scanning chunk %d/%d (%d files)", idx+1, len(chunks), chunk.FileCount)
-		comments, summary, err := runScanChunk(ctx, entry, repoDir, chunk.Files, cfg, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
+		comments, summary, err := runScanChunk(ctx, entry, repoDir, chunk.Files, cfg, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal, cfg.ScanConcurrency)
 		if err != nil {
 			log.Printf("Chunk %d failed: %v", idx, err)
 			continue
