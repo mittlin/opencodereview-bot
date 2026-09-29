@@ -356,10 +356,6 @@ queue.InProgress = &ScanProgress{
 	return scanChunksAndReport(ctx, entry, cfg, allComments, allSummaries, scanSuccessful, gitlabURLVal, gitlabTokenVal, "Nightly Scan Report")
 }
 
-func buildIssueBody(comments []ReviewComment, summary, projectPath, defaultBranch, gitlabURL string, triggerIssueIID int) string {
-	return FormatIssueBody(comments, summary, projectPath, defaultBranch, gitlabURL, triggerIssueIID)
-}
-
 // buildSummaryComment creates the summary table posted on the trigger issue.
 func buildSummaryComment(byFile map[string][]ReviewComment, fileIssues map[string]int, gitlabURL, projectPath, defaultBranch string) string {
 	var b strings.Builder

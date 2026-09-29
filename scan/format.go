@@ -148,7 +148,8 @@ func FormatIssueBody(comments []ReviewComment, summary, projectPath, defaultBran
 	}
 	b.WriteString(fmt.Sprintf("**Project:** %s\n", projectPath))
 	b.WriteString(fmt.Sprintf("**Branch:** %s\n", defaultBranch))
-	b.WriteString(fmt.Sprintf("**Scan Time:** %s UTC\n\n", time.Now().Format("2006-01-02 15:04:05")))
+	beijingTime := time.Now().Add(8 * time.Hour).Format("2006-01-02 15:04:05")
+	b.WriteString(fmt.Sprintf("**Scan Time:** %s CST\n\n", beijingTime))
 
 	// Count by severity
 	var sevCounts [4]int
@@ -262,17 +263,19 @@ func FormatIssueBody(comments []ReviewComment, summary, projectPath, defaultBran
 
 // FormatFileIssueBody creates an issue body for a single file's findings.
 // Uses severity → category grouping within the file.
-func FormatFileIssueBody(comments []ReviewComment, filePath, projectPath, defaultBranch, gitlabURL string) string {
+func FormatFileIssueBody(comments []ReviewComment, filePath, projectPath, branch, gitlabURL string) string {
 	var b strings.Builder
 
 	baseName := GetFileBaseName(filePath)
 	fileLink := fmt.Sprintf("[%s](%s/%s/-/blob/%s/%s)",
-		filePath, gitlabURL, projectPath, defaultBranch, filePath)
+		filePath, gitlabURL, projectPath, branch, filePath)
 
 	b.WriteString(fmt.Sprintf("## %s\n\n", baseName))
 	b.WriteString(fmt.Sprintf("**File:** %s\n", fileLink))
 	b.WriteString(fmt.Sprintf("**Project:** %s\n", projectPath))
-	b.WriteString(fmt.Sprintf("**Scan Time:** %s UTC\n\n", time.Now().Format("2006-01-02 15:04:05")))
+	b.WriteString(fmt.Sprintf("**Branch:** %s\n", branch))
+	beijingTime := time.Now().Add(8 * time.Hour).Format("2006-01-02 15:04:05")
+	b.WriteString(fmt.Sprintf("**Scan Time:** %s CST\n\n", beijingTime))
 
 	// Count by severity
 	var sevCounts [4]int
@@ -355,7 +358,7 @@ func FormatFileIssueBody(comments []ReviewComment, filePath, projectPath, defaul
 			b.WriteString(fmt.Sprintf("#### %s (%d)\n\n", capitalize(cat), len(catGroup)))
 			for i, c := range catGroup {
 				b.WriteString(fmt.Sprintf("%d. %s\n\n", i+1,
-					FormatCommentBody(c, gitlabURL, projectPath, defaultBranch)))
+					FormatCommentBody(c, gitlabURL, projectPath, branch)))
 			}
 		}
 	}
