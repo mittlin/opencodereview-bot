@@ -374,13 +374,49 @@ func TriggerImmediateScan(ctx context.Context, projectID int, pathWithNamespace 
 	cfg := LoadConfig()
 	sem := GetTaskSemaphore(cfg.ReviewConcurrency)
 
-	// Try to acquire semaphore immediately
+	// Acquire semaphore slot, then run scan in goroutine that releases on completion
 	select {
 	case sem <- struct{}{}:
-		// Got the slot, run immediately
+		// Got the slot, run scan with semaphore protection
 		go func() {
 			defer func() { <-sem }()
-			log.Printf("Immediate review completed for %s", pathWithNamespace)
+
+			botToken := os.Getenv("BOT_TOKEN")
+			gitlabURLVal := gitlabURL
+			gitlabTokenVal := gitlabToken
+			llmURLVal := os.Getenv("LLM_URL")
+			llmTokenVal := os.Getenv("LLM_TOKEN")
+			llmModelVal := os.Getenv("LLM_MODEL")
+			languageVal := os.Getenv("OCR_LANGUAGE")
+			if languageVal == "" {
+				languageVal = "Chinese"
+			}
+			maxTokensBudgetVal := os.Getenv("OCR_MAX_TOKENS_BUDGET")
+			effortVal := os.Getenv("OCR_EFFORT")
+			providerVal := os.Getenv("OCR_PROVIDER")
+
+			scanCtx := context.Background()
+			entry := PriorityEntry{
+				ProjectID:         projectID,
+				PathWithNamespace: pathWithNamespace,
+				TriggerTime:       time.Now(),
+				TriggerIssueIID:   issueIID,
+				TriggerType:       "immediate_review",
+				BasePriority:      200,
+				SourceBranch:      sourceBranch,
+			}
+
+			result, err := runImmediateScan(scanCtx, entry, cfg, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
+			if err != nil {
+				log.Printf("Immediate review failed for %s: %v", pathWithNamespace, err)
+				return
+			}
+
+			if result != nil && len(result.Comments) > 0 {
+				log.Printf("Immediate review found %d issues in %s", len(result.Comments), pathWithNamespace)
+			} else if result != nil {
+				log.Printf("Immediate review completed for %s (no issues found or scan failed)", pathWithNamespace)
+			}
 		}()
 	default:
 		// No slot available, queue for later with priority 200
@@ -404,46 +440,6 @@ func TriggerImmediateScan(ctx context.Context, projectID int, pathWithNamespace 
 		AddToImmediateQueue(queue, entry)
 		return SaveQueue(queue)
 	}
-
-	go func() {
-		cfg := LoadConfig()
-		botToken := os.Getenv("BOT_TOKEN")
-		gitlabURLVal := gitlabURL
-		gitlabTokenVal := gitlabToken
-		llmURLVal := os.Getenv("LLM_URL")
-		llmTokenVal := os.Getenv("LLM_TOKEN")
-		llmModelVal := os.Getenv("LLM_MODEL")
-		languageVal := os.Getenv("OCR_LANGUAGE")
-		if languageVal == "" {
-			languageVal = "Chinese"
-		}
-		maxTokensBudgetVal := os.Getenv("OCR_MAX_TOKENS_BUDGET")
-		effortVal := os.Getenv("OCR_EFFORT")
-		providerVal := os.Getenv("OCR_PROVIDER")
-
-		scanCtx := context.Background()
-		entry := PriorityEntry{
-			ProjectID:         projectID,
-			PathWithNamespace: pathWithNamespace,
-			TriggerTime:       time.Now(),
-			TriggerIssueIID:   issueIID,
-			TriggerType:       "immediate_review",
-			BasePriority:      200,
-			SourceBranch:      sourceBranch,
-		}
-
-		result, err := runImmediateScan(scanCtx, entry, cfg, botToken, gitlabURLVal, gitlabTokenVal, llmURLVal, llmTokenVal, llmModelVal, languageVal, maxTokensBudgetVal, effortVal, providerVal)
-		if err != nil {
-			log.Printf("Immediate review failed for %s: %v", pathWithNamespace, err)
-			return
-		}
-
-		if result != nil && len(result.Comments) > 0 {
-			log.Printf("Immediate review found %d issues in %s", len(result.Comments), pathWithNamespace)
-		} else if result != nil {
-			log.Printf("Immediate review completed for %s (no issues found or scan failed)", pathWithNamespace)
-		}
-	}()
 
 	return nil
 }
