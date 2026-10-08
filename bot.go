@@ -59,7 +59,10 @@ type PushEvent struct {
 		PathWithNamespace string `json:"path_with_namespace"`
 	} `json:"project"`
 	Commits []struct {
-		ID string `json:"id"`
+		ID      string   `json:"id"`
+		Added   []string `json:"added"`
+		Modified []string `json:"modified"`
+		Removed []string `json:"removed"`
 	} `json:"commits"`
 }
 
@@ -400,17 +403,31 @@ func pushHandler(w http.ResponseWriter, r *http.Request, event PushEvent) {
 		"commit": event.After, "from": event.Before,
 	})
 
+	// Convert push event commits to scan.PushCommit
+	pushCommits := make([]scan.PushCommit, len(event.Commits))
+	for i, c := range event.Commits {
+		pushCommits[i] = scan.PushCommit{
+			ID:       c.ID,
+			Added:    c.Added,
+			Modified: c.Modified,
+			Removed:  c.Removed,
+		}
+	}
+
 	// Async: review from before to after (entire push range)
 	go runReviewAsync(event.Project.ID, event.Before, event.After,
 		event.Project.PathWithNamespace, "push", branch, branch,
-		func(pid int, sha string, comments []ReviewComment, repoDir string) {
-			// Build file -> commit map for distributing comments
-			ctx := context.Background()
-			fileToCommit, err := buildFileToCommitMap(ctx, repoDir, event.Before, event.After)
-			if err != nil {
-				log.Printf("Warning: failed to build file-commit map: %v, falling back to after SHA", err)
-				postCommentsToCommit(pid, sha, comments, event.Project.PathWithNamespace, branch)
-				return
+		pushCommits,
+		func(pid int, sha string, comments []ReviewComment, repoDir string, fileToCommit map[string]string) {
+			// Check for files without commit mapping early (now runs after clone, before review)
+			var unmappedFiles []string
+			for _, c := range comments {
+				if fileToCommit[c.File] == "" {
+					unmappedFiles = append(unmappedFiles, c.File)
+				}
+			}
+			if len(unmappedFiles) > 0 {
+				log.Printf("Warning: %d files have no commit mapping, will use after SHA: %v", len(unmappedFiles), unmappedFiles)
 			}
 
 			// Group comments by target commit
@@ -419,7 +436,6 @@ func pushHandler(w http.ResponseWriter, r *http.Request, event PushEvent) {
 				targetSHA := fileToCommit[c.File]
 				if targetSHA == "" {
 					targetSHA = sha // fallback to after SHA
-					log.Printf("Warning: no commit mapping for file %s, using after SHA", c.File)
 				}
 				commentsByCommit[targetSHA] = append(commentsByCommit[targetSHA], c)
 			}
@@ -456,7 +472,8 @@ func mrHandler(w http.ResponseWriter, r *http.Request, event MergeRequestEvent) 
 	go runReviewAsync(event.Project.ID, "", event.ObjectAttributes.LastCommitSHA,
 		event.Project.PathWithNamespace, "merge_request",
 		event.ObjectAttributes.SourceBranch, event.ObjectAttributes.TargetBranch,
-		func(pid int, sha string, comments []ReviewComment, repoDir string) {
+		nil,
+		func(pid int, sha string, comments []ReviewComment, repoDir string, fileToCommit map[string]string) {
 			postCommentsToMR(pid, mrIID, comments, event.Project.PathWithNamespace, event.ObjectAttributes.TargetBranch)
 		})
 }
@@ -495,7 +512,8 @@ func releaseHandler(w http.ResponseWriter, r *http.Request, event ReleaseEvent) 
 	go runReviewAsync(event.Project.ID, prevTag, tagCommitSHA,
 		event.Project.PathWithNamespace, "release",
 		event.Release.TagName, event.Release.TagName,
-		func(pid int, sha string, comments []ReviewComment, repoDir string) {
+		nil,
+		func(pid int, sha string, comments []ReviewComment, repoDir string, fileToCommit map[string]string) {
 			postCommentsToCommit(pid, sha, comments, event.Project.PathWithNamespace, event.Release.TagName)
 		})
 }
@@ -620,9 +638,10 @@ func runReviewWithRepoDir(ctx context.Context, req ReviewRequest, repoDir string
 }
 
 // runReviewAsync executes review in background with concurrency control.
-// postFunc receives: projectID, commitSHA, comments, repoDir
+// postFunc receives: projectID, commitSHA, comments, repoDir, fileToCommitMap
 func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourceBranch, targetBranch string,
-	postFunc func(int, string, []ReviewComment, string)) {
+	pushCommits []scan.PushCommit,
+	postFunc func(int, string, []ReviewComment, string, map[string]string)) {
 
 	displayProject := projectPath
 	if displayProject == "" {
@@ -672,6 +691,24 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 	}
 	defer cleanup()
 
+	// Build file-to-commit map early (after clone, before review)
+	// Only for push events with commit list
+	var fileToCommit map[string]string
+	if len(pushCommits) > 0 {
+		fileToCommit, err = scan.BuildFileToCommitMapFromCommits(ctx, repoDir, pushCommits)
+		if err != nil {
+			log.Printf("Warning: failed to build file-commit map: %v, falling back to after SHA", err)
+			fileToCommit = make(map[string]string)
+		} else {
+			// Check for files without commit mapping early
+			// We need to know what files will be reviewed - use a quick diff to get file list
+			// But since we don't have comments yet, we'll defer the unmapped check to callback
+			log.Printf("Built file-to-commit map with %d entries", len(fileToCommit))
+		}
+	} else {
+		fileToCommit = make(map[string]string)
+	}
+
 	result, err := runReviewWithRepoDir(ctx, req, repoDir)
 	if err != nil {
 		log.Printf("Review error: project=%s from=%s to=%s error=%v",
@@ -679,62 +716,12 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 		return
 	}
 
-	postFunc(projectID, toSHA, result.Comments, repoDir)
+	postFunc(projectID, toSHA, result.Comments, repoDir, fileToCommit)
 	log.Printf("Review completed: project=%s from=%s to=%s comments=%d",
 		displayProject, fromSHA, toSHA, len(result.Comments))
 }
 
-// ── Git operations ──────────────────────────────────────────────────────────
-
-// buildFileToCommitMap runs git log --name-only from..to and returns
-// a map of filePath -> lastCommitSHA that modified that file in the range.
-// Only considers Added, Modified, Deleted, Renamed files (--diff-filter=AMDR).
-func buildFileToCommitMap(ctx context.Context, repoDir, fromSHA, toSHA string) (map[string]string, error) {
-	// Handle first push (fromSHA is zero SHA) - use all commits up to toSHA
-	var logRange string
-	zeroSHA := "0000000000000000000000000000000000000000"
-	if fromSHA == zeroSHA {
-		logRange = toSHA
-	} else {
-		logRange = fromSHA + ".." + toSHA
-	}
-
-	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "log", "--name-only", "--pretty=format:%H", "--diff-filter=AMDR", "--", logRange)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("git log failed: %w, output: %s", err, string(output))
-	}
-
-	fileToCommit := make(map[string]string)
-	var currentCommit string
-
-	for _, line := range strings.Split(string(output), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		// Commit SHA is 40 hex chars
-		if len(line) == 40 && isHexString(line) {
-			currentCommit = line
-			continue
-		}
-		// File path
-		if currentCommit != "" {
-			fileToCommit[line] = currentCommit
-		}
-	}
-
-	return fileToCommit, nil
-}
-
-func isHexString(s string) bool {
-	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-			return false
-		}
-	}
-	return true
-}
+// ── GitLab API: post comments ──────────────────────────────────────────────
 
 func getTagCommitSHA(projectID int, tagName string) (string, error) {
 	url := fmt.Sprintf("%s/api/v4/projects/%d/repository/commits/%s", gitlabURL, projectID, tagName)
@@ -806,8 +793,6 @@ func getPrevReleaseTag(projectID int, currentTag string) (string, error) {
 	// Try git-based fallback
 	return fmt.Sprintf("%s~1", currentTag), nil
 }
-
-// ── GitLab API: post comments ──────────────────────────────────────────────
 
 func postCommentsToMR(projectID, mrIID int, comments []ReviewComment, projectPath, defaultBranch string) {
 	if gitlabToken == "" {

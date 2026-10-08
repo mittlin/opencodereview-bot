@@ -269,3 +269,82 @@ func ResolveBranch(ctx context.Context, gitlabURL, gitlabToken, projectPath stri
 		return "", fmt.Errorf("multiple valid branch labels found: %v. Only one allowed.", validBranches)
 	}
 }
+
+// PushCommit represents a commit from a GitLab push event.
+type PushCommit struct {
+	ID      string
+	Added   []string
+	Modified []string
+	Removed []string
+}
+
+// BuildFileToCommitMapFromCommits builds a file->commit map using the commit
+// list from a GitLab push event. Always runs git diff-tree -M for rename
+// detection, merges with webhook file lists (added/modified/removed) for
+// completeness. Prefers git for rename accuracy.
+func BuildFileToCommitMapFromCommits(ctx context.Context, repoDir string, commits []PushCommit) (map[string]string, error) {
+	fileToCommit := make(map[string]string)
+
+	for _, c := range commits {
+		if c.ID == "" {
+			continue
+		}
+
+		// --- Always run git diff-tree -M for rename detection ---
+		gitFiles := make(map[string]bool)
+		cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "diff-tree", "--name-only", "-r", "-M", c.ID)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			lines := strings.Split(string(output), "\n")
+			// Skip first line (commit SHA header), process remaining as files
+			for i := 1; i < len(lines); i++ {
+				file := strings.TrimSpace(lines[i])
+				if file != "" {
+					gitFiles[file] = true
+				}
+			}
+		} else {
+			log.Printf("Warning: git diff-tree failed for commit %s: %v", c.ID, err)
+		}
+
+		// --- Collect webhook files ---
+		webhookFiles := make(map[string]bool)
+		hasWebhookData := len(c.Added) > 0 || len(c.Modified) > 0 || len(c.Removed) > 0
+		if hasWebhookData {
+			for _, f := range c.Added {
+				webhookFiles[f] = true
+			}
+			for _, f := range c.Modified {
+				webhookFiles[f] = true
+			}
+			for _, f := range c.Removed {
+				webhookFiles[f] = true
+			}
+		}
+
+		// --- Merge: union of both, prefer git for accuracy ---
+		allFiles := make(map[string]bool)
+		for f := range gitFiles {
+			allFiles[f] = true
+		}
+		for f := range webhookFiles {
+			allFiles[f] = true
+		}
+
+		// --- Log source used ---
+		source := "git"
+		if hasWebhookData && len(gitFiles) == 0 {
+			source = "webhook"
+		} else if hasWebhookData && len(gitFiles) > 0 {
+			source = "webhook+git"
+		}
+		log.Printf("Commit %s: %d files from %s", c.ID[:8], len(allFiles), source)
+
+		// --- Assign to map ---
+		for file := range allFiles {
+			fileToCommit[file] = c.ID
+		}
+	}
+
+	return fileToCommit, nil
+}
