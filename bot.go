@@ -414,11 +414,21 @@ func pushHandler(w http.ResponseWriter, r *http.Request, event PushEvent) {
 		}
 	}
 
+	// For single commit pushes, we don't need per-commit file mapping
+	// All comments will go to the single commit (after SHA)
+	singleCommit := len(event.Commits) == 1
+
 	// Async: review from before to after (entire push range)
 	go runReviewAsync(event.Project.ID, event.Before, event.After,
 		event.Project.PathWithNamespace, "push", branch, branch,
 		pushCommits,
 		func(pid int, sha string, comments []ReviewComment, repoDir string, fileToCommit map[string]string) {
+			// If no comments, post "no issues found" comment
+			if len(comments) == 0 {
+				postNoIssuesComment(pid, sha, event.Project.PathWithNamespace, branch, singleCommit)
+				return
+			}
+
 			// Check for files without commit mapping early (now runs after clone, before review)
 			var unmappedFiles []string
 			for _, c := range comments {
@@ -692,20 +702,18 @@ func runReviewAsync(projectID int, fromSHA, toSHA, projectPath, eventType, sourc
 	defer cleanup()
 
 	// Build file-to-commit map early (after clone, before review)
-	// Only for push events with commit list
+	// Only for push events with multiple commits (single commit doesn't need mapping)
 	var fileToCommit map[string]string
-	if len(pushCommits) > 0 {
+	if len(pushCommits) > 1 {
 		fileToCommit, err = scan.BuildFileToCommitMapFromCommits(ctx, repoDir, pushCommits)
 		if err != nil {
 			log.Printf("Warning: failed to build file-commit map: %v, falling back to after SHA", err)
 			fileToCommit = make(map[string]string)
 		} else {
-			// Check for files without commit mapping early
-			// We need to know what files will be reviewed - use a quick diff to get file list
-			// But since we don't have comments yet, we'll defer the unmapped check to callback
 			log.Printf("Built file-to-commit map with %d entries", len(fileToCommit))
 		}
 	} else {
+		// Single commit push - no per-file mapping needed, all comments go to the single commit
 		fileToCommit = make(map[string]string)
 	}
 
@@ -856,6 +864,43 @@ func postCommentsToCommit(projectID int, commitSHA string, comments []ReviewComm
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
+}
+
+func postNoIssuesComment(projectID int, commitSHA string, projectPath, defaultBranch string, singleCommit bool) {
+	if gitlabToken == "" {
+		return
+	}
+
+	var bodyText string
+	if singleCommit {
+		bodyText = "✅ **No issues found** in this commit\n\n" +
+			"All files scanned successfully with no findings."
+	} else {
+		bodyText = "✅ **No issues found** in this push\n\n" +
+			"All files scanned successfully with no findings."
+	}
+
+	url := fmt.Sprintf("%s/api/v4/projects/%d/repository/commits/%s/discussions", gitlabURL, projectID, commitSHA)
+
+	body := map[string]interface{}{
+		"body": bodyText,
+	}
+
+	jsonBody, _ := json.Marshal(body)
+	httpReq, _ := http.NewRequest("POST", url, strings.NewReader(string(jsonBody)))
+	httpReq.Header.Set("PRIVATE-TOKEN", gitlabToken)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		log.Printf("Failed to post no-issues comment: %v", err)
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	log.Printf("Posted 'no issues' comment to commit %s", commitSHA[:8])
 }
 
 // ── Utilities ───────────────────────────────────────────────────────────────
